@@ -39,6 +39,9 @@ struct Args {
 #[derive(Clone)]
 struct RpcMethod(String);
 
+#[derive(Clone)]
+struct SelectedBackend(String);
+
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
     port: u16,
@@ -163,12 +166,22 @@ pub async fn log_requests(
     let response = next.run(req).await;
     let duration = start.elapsed();
 
-    match rpc_method {
-        Some(RpcMethod(m)) => info!(
+    // Extract backend from response extensions (set by proxy handler)
+    let backend = response.extensions().get::<SelectedBackend>().cloned();
+
+    match (rpc_method, backend) {
+        (Some(RpcMethod(m)), Some(SelectedBackend(b))) => info!(
+            "{} {} {} {:?} rpc_method={} backend={}",
+            method, path, addr, duration, m, b
+        ),
+        (Some(RpcMethod(m)), None) => info!(
             "{} {} {} {:?} rpc_method={}",
             method, path, addr, duration, m
         ),
-        None => info!("{} {} {} {:?}", method, path, addr, duration),
+        (None, Some(SelectedBackend(b))) => {
+            info!("{} {} {} {:?} backend={}", method, path, addr, duration, b)
+        }
+        (None, None) => info!("{} {} {} {:?}", method, path, addr, duration),
     }
 
     response
@@ -238,7 +251,12 @@ async fn proxy(
 
     // Forward request
     match state.client.request(req).await {
-        Ok(resp) => resp.into_response(),
+        Ok(mut resp) => {
+            // Store selected backend in response extensions for logging
+            resp.extensions_mut()
+                .insert(SelectedBackend(backend_url.to_string()));
+            resp.into_response()
+        }
         Err(err) => {
             info!("Backend request failed: {} (error type: {:?})", err, err);
             (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", err)).into_response()
@@ -288,7 +306,7 @@ async fn main() {
         .layer(middleware::from_fn(extract_rpc_method));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    println!("Listening on http://{}", addr);
+    info!("Listening on http://{}", addr);
 
     axum::serve(
         tokio::net::TcpListener::bind(addr).await.unwrap(),
