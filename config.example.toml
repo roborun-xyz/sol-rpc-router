@@ -8,6 +8,14 @@ port = 28899
 # Requests must include ?api-key=<key> in the query string
 api_keys = ["your-api-key-1", "your-api-key-2", "your-api-key-3"]
 
+# Health check configuration (optional - all fields have defaults)
+[health_check]
+interval_secs = 30              # Check backends every 30 seconds
+timeout_secs = 5                # Timeout for each health check request
+method = "getSlot"              # JSON-RPC method to use for health checks
+consecutive_failures_threshold = 3     # Mark unhealthy after 3 consecutive failures
+consecutive_successes_threshold = 2    # Mark healthy after 2 consecutive successes
+
 # Backend RPC endpoints with weights
 # Weight determines the probability of selection for load balancing:
 # - Backend with weight 2 gets 2x more requests than weight 1

@@ -1,291 +1,32 @@
-use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc};
+mod config;
+mod handlers;
+mod health;
+mod state;
+
+use config::load_config;
+use handlers::{extract_rpc_method, health_endpoint, log_requests, proxy};
+use health::{health_check_loop, HealthState};
+use state::AppState;
 
 use axum::{
-    body::{to_bytes, Body},
-    extract::{ConnectInfo, Query, State},
-    http::{Request, StatusCode, Uri},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::post,
+    middleware,
+    routing::{get, post},
     Router,
 };
 use clap::Parser;
 use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use rand::Rng;
-use serde::Deserialize;
+use hyper_util::client::legacy::Client;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tracing::info;
 use tracing_subscriber;
 
-const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
-
-/// RPC Proxy with weighted load balancing and method-based routing
 #[derive(Parser, Debug)]
-#[command(name = "rpc-proxy")]
-#[command(about = "High-performance RPC proxy with load balancing", long_about = None)]
+#[command(name = "rpc-router")]
+#[command(about = "RPC router with load balancing and health monitoring", long_about = None)]
 struct Args {
     /// Path to configuration file
     #[arg(short, long, default_value = "config.toml")]
     config: String,
-}
-
-#[derive(Clone)]
-struct RpcMethod(String);
-
-#[derive(Clone)]
-struct SelectedBackend(String);
-
-#[derive(Debug, Deserialize, Clone)]
-struct Config {
-    port: u16,
-    api_keys: Vec<String>,
-    backends: Vec<Backend>,
-    #[serde(default)]
-    method_routes: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct Backend {
-    label: String,
-    url: String,
-    #[serde(default = "default_weight")]
-    weight: u32,
-}
-
-fn default_weight() -> u32 {
-    1
-}
-
-#[derive(Clone)]
-struct AppState {
-    client: Client<HttpsConnector<HttpConnector>, Body>,
-    backends: Vec<Backend>,
-    total_weight: u32,
-    api_keys: Vec<String>,
-    method_routes: HashMap<String, String>,
-    label_to_url: HashMap<String, String>,
-}
-
-impl AppState {
-    fn select_backend(&self, rpc_method: Option<&str>) -> (&str, &str) {
-        // Check method-specific routing first
-        if let Some(method) = rpc_method {
-            if let Some(backend_label) = self.method_routes.get(method) {
-                if let Some(backend_url) = self.label_to_url.get(backend_label) {
-                    info!("Method {} routed to label={}", method, backend_label);
-                    return (backend_label, backend_url);
-                }
-            }
-        }
-
-        // Weighted random selection
-        let mut rng = rand::thread_rng();
-        let mut random_weight = rng.gen_range(0..self.total_weight);
-
-        for backend in &self.backends {
-            if random_weight < backend.weight {
-                return (&backend.label, &backend.url);
-            }
-            random_weight -= backend.weight;
-        }
-
-        // Fallback (should never reach here if weights are valid)
-        (&self.backends[0].label, &self.backends[0].url)
-    }
-}
-
-#[derive(Deserialize)]
-struct Params {
-    #[serde(rename = "api-key")]
-    api_key: Option<String>,
-}
-
-fn load_config(config_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    if !std::path::Path::new(config_path).exists() {
-        return Err(format!("Configuration file not found: {}", config_path).into());
-    }
-
-    // Read TOML file directly to preserve case sensitivity
-    let contents = fs::read_to_string(config_path)?;
-    let config: Config = toml::from_str(&contents)?;
-
-    // Validation
-    if config.api_keys.is_empty() {
-        return Err("At least one API key must be configured".into());
-    }
-    if config.backends.is_empty() {
-        return Err("At least one backend must be configured".into());
-    }
-
-    // Create a set of valid backend labels for validation
-    let backend_labels: HashMap<String, String> = config
-        .backends
-        .iter()
-        .map(|b| (b.label.clone(), b.url.clone()))
-        .collect();
-
-    // Check for duplicate labels
-    if backend_labels.len() != config.backends.len() {
-        return Err("Duplicate backend labels found in configuration".into());
-    }
-
-    for backend in &config.backends {
-        if backend.weight == 0 {
-            return Err(format!("Backend '{}' has invalid weight 0", backend.label).into());
-        }
-        if backend.label.is_empty() {
-            return Err(format!("Backend with URL '{}' has empty label", backend.url).into());
-        }
-    }
-
-    // Validate method_routes reference valid backend labels
-    for (method, label) in &config.method_routes {
-        if !backend_labels.contains_key(label) {
-            return Err(format!(
-                "Method route '{}' references unknown backend label '{}'",
-                method, label
-            )
-            .into());
-        }
-    }
-
-    Ok(config)
-}
-
-pub async fn extract_rpc_method(mut req: Request<Body>, next: Next) -> Response {
-    // Read body, extract "method" field, then reconstruct the request
-    let (parts, body) = req.into_parts();
-    let body_bytes = match to_bytes(body, MAX_BODY_SIZE).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            // If body read fails, pass empty body downstream
-            return next.run(Request::from_parts(parts, Body::empty())).await;
-        }
-    };
-
-    // Try to extract "method" from JSON
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-        if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
-            req = Request::from_parts(parts, Body::from(body_bytes.clone()));
-            req.extensions_mut().insert(RpcMethod(method.to_string()));
-            return next.run(req).await;
-        }
-    }
-
-    // If no method found, reconstruct request with original body
-    req = Request::from_parts(parts, Body::from(body_bytes));
-    next.run(req).await
-}
-
-pub async fn log_requests(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let rpc_method = req.extensions().get::<RpcMethod>().cloned();
-
-    let start = std::time::Instant::now();
-    let response = next.run(req).await;
-    let duration = start.elapsed();
-
-    // Extract backend from response extensions (set by proxy handler)
-    let backend = response.extensions().get::<SelectedBackend>().cloned();
-
-    match (rpc_method, backend) {
-        (Some(RpcMethod(m)), Some(SelectedBackend(b))) => info!(
-            "{} {} {} {:?} rpc_method={} backend={}",
-            method, path, addr, duration, m, b
-        ),
-        (Some(RpcMethod(m)), None) => info!(
-            "{} {} {} {:?} rpc_method={}",
-            method, path, addr, duration, m
-        ),
-        (None, Some(SelectedBackend(b))) => {
-            info!("{} {} {} {:?} backend={}", method, path, addr, duration, b)
-        }
-        (None, None) => info!("{} {} {} {:?}", method, path, addr, duration),
-    }
-
-    response
-}
-
-async fn proxy(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<Params>,
-    mut req: Request<Body>,
-) -> impl IntoResponse {
-    match params.api_key {
-        Some(ref key) if state.api_keys.contains(key) => {}
-        Some(ref key) => {
-            info!("API key '{}' is invalid", key);
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-        }
-        None => {
-            info!("No API key provided");
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-        }
-    }
-
-    // Get RPC method from extension (set by extract_rpc_method middleware)
-    let rpc_method = req.extensions().get::<RpcMethod>().map(|m| m.0.as_str());
-
-    // Select backend based on method routing or weighted random
-    let (backend_label, backend_url) = state.select_backend(rpc_method);
-
-    // Rebuild URI (remove ?api-key=... from request)
-    let request_path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|x| x.as_str())
-        .unwrap_or("/");
-
-    // Remove api-key from the incoming request's query parameters
-    let cleaned_request_path = if let Some(pos) = request_path_and_query.find("?api-key=") {
-        &request_path_and_query[..pos]
-    } else {
-        request_path_and_query
-    };
-
-    // Build URI with selected backend
-    let uri_string = if cleaned_request_path == "/" {
-        // For root path requests, don't add trailing slash
-        backend_url.trim_end_matches('/').to_string()
-    } else if backend_url.ends_with('/') && cleaned_request_path.starts_with('/') {
-        // Avoid double slashes
-        format!("{}{}", backend_url, &cleaned_request_path[1..])
-    } else {
-        format!("{}{}", backend_url, cleaned_request_path)
-    };
-    let parsed_uri = uri_string.parse::<Uri>().unwrap();
-
-    // Update Host header to match the backend
-    if let Some(host) = parsed_uri.host() {
-        let host_value = if let Some(port) = parsed_uri.port_u16() {
-            format!("{}:{}", host, port)
-        } else {
-            host.to_string()
-        };
-        req.headers_mut()
-            .insert("host", host_value.parse().unwrap());
-    }
-
-    *req.uri_mut() = parsed_uri;
-
-    // Forward request
-    match state.client.request(req).await {
-        Ok(mut resp) => {
-            // Store selected backend label in response extensions for logging
-            resp.extensions_mut()
-                .insert(SelectedBackend(backend_label.to_string()));
-            resp.into_response()
-        }
-        Err(err) => {
-            info!("Backend request failed: {} (error type: {:?})", err, err);
-            (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", err)).into_response()
-        }
-    }
 }
 
 #[tokio::main]
@@ -314,8 +55,6 @@ async fn main() {
         }
     }
 
-    let total_weight: u32 = config.backends.iter().map(|b| b.weight).sum();
-
     // Build label-to-URL mapping
     let label_to_url: HashMap<String, String> = config
         .backends
@@ -323,25 +62,54 @@ async fn main() {
         .map(|b| (b.label.clone(), b.url.clone()))
         .collect();
 
+    // Initialize health state
+    let backend_labels: Vec<String> = config.backends.iter().map(|b| b.label.clone()).collect();
+    let health_state = Arc::new(HealthState::new(backend_labels));
+
     let https = HttpsConnector::new();
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+
     let state = Arc::new(AppState {
-        client: Client::builder(hyper_util::rt::TokioExecutor::new()).build(https),
-        backends: config.backends,
-        total_weight,
+        client: client.clone(),
+        backends: config.backends.clone(),
         api_keys: config.api_keys,
         method_routes: config.method_routes,
         label_to_url,
+        health_state: health_state.clone(),
+    });
+
+    // Spawn background health check task
+    let health_check_client = client.clone();
+    let health_check_backends = config.backends.clone();
+    let health_check_config = config.health_check.clone();
+
+    tokio::spawn(async move {
+        info!(
+            "Starting health check loop (interval: {}s, timeout: {}s, method: {})",
+            health_check_config.interval_secs,
+            health_check_config.timeout_secs,
+            health_check_config.method
+        );
+        health_check_loop(
+            health_check_client,
+            health_check_backends,
+            health_state,
+            health_check_config,
+        )
+        .await;
     });
 
     let app = Router::new()
         .route("/", post(proxy))
         .route("/*path", post(proxy))
+        .route("/health", get(health_endpoint))
         .with_state(state)
         .layer(middleware::from_fn(log_requests))
         .layer(middleware::from_fn(extract_rpc_method));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     info!("Listening on http://{}", addr);
+    info!("Health monitoring endpoint: http://{}/health", addr);
 
     axum::serve(
         tokio::net::TcpListener::bind(addr).await.unwrap(),
