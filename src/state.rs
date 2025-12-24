@@ -1,11 +1,12 @@
-use crate::config::Backend;
-use crate::health::HealthState;
+use std::{collections::HashMap, sync::Arc};
+
 use axum::body::Body;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use rand::Rng;
-use std::{collections::HashMap, sync::Arc};
 use tracing::info;
+
+use crate::{config::Backend, health::HealthState};
 
 #[derive(Clone)]
 pub struct AppState {

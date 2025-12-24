@@ -1,4 +1,5 @@
-use crate::state::AppState;
+use std::{net::SocketAddr, sync::Arc};
+
 use axum::{
     body::{to_bytes, Body},
     extract::{ConnectInfo, Query, State},
@@ -8,8 +9,9 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
 use tracing::info;
+
+use crate::state::AppState;
 
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
@@ -180,7 +182,6 @@ pub struct HealthResponse {
 #[derive(Serialize)]
 pub struct BackendHealth {
     pub label: String,
-    pub url: String,
     pub healthy: bool,
     pub last_check: Option<String>,
     pub consecutive_failures: u32,
@@ -206,7 +207,6 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRes
 
         backends.push(BackendHealth {
             label: backend.label.clone(),
-            url: backend.url.clone(),
             healthy: status.healthy,
             last_check: status.last_check_time.map(|t| format!("{:?}", t)),
             consecutive_failures: status.consecutive_failures,

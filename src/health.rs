@@ -1,13 +1,15 @@
-use crate::config::{Backend, HealthCheckConfig};
-use axum::{body::Body, http::Request};
-use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
     time::SystemTime,
 };
+
+use axum::{body::Body, http::Request};
+use hyper_tls::HttpsConnector;
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use tokio::time::{sleep, timeout, Duration};
+
+use crate::config::{Backend, HealthCheckConfig};
 
 #[derive(Debug, Clone)]
 pub struct BackendHealthStatus {
@@ -139,7 +141,7 @@ pub async fn health_check_loop(
                         current_status.healthy = true;
                     }
 
-                    tracing::trace!(
+                    tracing::info!(
                         "Health check succeeded for backend {} (consecutive successes: {})",
                         backend.label,
                         current_status.consecutive_successes

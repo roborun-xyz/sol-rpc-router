@@ -3,10 +3,7 @@ mod handlers;
 mod health;
 mod state;
 
-use config::load_config;
-use handlers::{extract_rpc_method, health_endpoint, log_requests, proxy};
-use health::{health_check_loop, HealthState};
-use state::AppState;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     middleware,
@@ -14,9 +11,12 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use config::load_config;
+use handlers::{extract_rpc_method, health_endpoint, log_requests, proxy};
+use health::{health_check_loop, HealthState};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use state::AppState;
 use tracing::info;
 use tracing_subscriber;
 
@@ -37,7 +37,7 @@ async fn main() {
     let args = Args::parse();
 
     // Load configuration from TOML file
-    let config = load_config(&args.config).expect("Failed to load configuration");
+    let config = load_config(&args.config).expect("Failed to load router configuration");
 
     info!("Loaded configuration from: {}", args.config);
     info!("Loaded {} backends", config.backends.len());
