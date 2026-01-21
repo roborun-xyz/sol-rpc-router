@@ -76,4 +76,50 @@ impl AppState {
             .first()
             .map(|b| (b.label.as_str(), b.url.as_str()))
     }
+
+    /// Select a healthy backend that has WebSocket support (ws_url configured)
+    pub fn select_ws_backend(&self) -> Option<(&str, &str)> {
+        // Filter to backends with ws_url configured and healthy
+        let ws_backends: Vec<&Backend> = self
+            .backends
+            .iter()
+            .filter(|b| {
+                b.ws_url.is_some()
+                    && self
+                        .health_state
+                        .get_status(&b.label)
+                        .map(|s| s.healthy)
+                        .unwrap_or(true)
+            })
+            .collect();
+
+        if ws_backends.is_empty() {
+            return None;
+        }
+
+        // Calculate total weight of WebSocket-capable backends
+        let total_weight: u32 = ws_backends.iter().map(|b| b.weight).sum();
+
+        // Weighted random selection
+        let mut rng = rand::thread_rng();
+        let mut random_weight = rng.gen_range(0..total_weight);
+
+        for backend in &ws_backends {
+            if random_weight < backend.weight {
+                return Some((
+                    backend.label.as_str(),
+                    backend.ws_url.as_ref().unwrap().as_str(),
+                ));
+            }
+            random_weight -= backend.weight;
+        }
+
+        // Fallback
+        ws_backends.first().map(|b| {
+            (
+                b.label.as_str(),
+                b.ws_url.as_ref().unwrap().as_str(),
+            )
+        })
+    }
 }

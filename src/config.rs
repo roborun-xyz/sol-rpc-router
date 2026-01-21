@@ -54,6 +54,7 @@ pub struct Backend {
     pub label: String,
     pub url: String,
     pub weight: u32,
+    pub ws_url: Option<String>,
 }
 
 pub fn load_config(config_path: &str) -> Result<Config, Box<dyn std::error::Error>> {

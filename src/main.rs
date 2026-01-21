@@ -12,13 +12,12 @@ use axum::{
 };
 use clap::Parser;
 use config::load_config;
-use handlers::{extract_rpc_method, health_endpoint, log_requests, proxy};
+use handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, ws_proxy};
 use health::{health_check_loop, HealthState};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use state::AppState;
 use tracing::info;
-use tracing_subscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "rpc-router")]
@@ -102,6 +101,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", post(proxy))
+        .route("/", get(ws_proxy))
         .route("/*path", post(proxy))
         .route("/health", get(health_endpoint))
         .with_state(state)

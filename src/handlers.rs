@@ -2,15 +2,20 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{ConnectInfo, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Query, State,
+    },
     http::{Request, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{timeout, Duration};
-use tracing::info;
+use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
+use tracing::{error, info};
 
 use crate::state::AppState;
 
@@ -238,4 +243,181 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
 
     Json(response)
+}
+
+pub async fn ws_proxy(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<Params>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    // Validate API key
+    match params.api_key {
+        Some(ref key) if state.api_keys.contains(key) => {}
+        Some(ref key) => {
+            info!("WebSocket: API key '{}' is invalid from {}", key, addr);
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+        None => {
+            info!("WebSocket: No API key provided from {}", addr);
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+
+    // Select a backend with WebSocket support
+    let (backend_label, backend_ws_url) = match state.select_ws_backend() {
+        Some(selection) => selection,
+        None => {
+            error!("No healthy WebSocket backends available");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No healthy WebSocket backends available",
+            )
+                .into_response();
+        }
+    };
+
+    let backend_label = backend_label.to_string();
+    let backend_ws_url = backend_ws_url.to_string();
+
+    info!(
+        "WebSocket: {} upgrading connection, backend={}",
+        addr, backend_label
+    );
+
+    ws.on_upgrade(move |client_socket| {
+        handle_ws_connection(client_socket, backend_ws_url, backend_label, addr)
+    })
+    .into_response()
+}
+
+async fn handle_ws_connection(
+    client_socket: WebSocket,
+    backend_url: String,
+    backend_label: String,
+    client_addr: SocketAddr,
+) {
+    // Connect to the backend WebSocket
+    let backend_socket = match connect_async(&backend_url).await {
+        Ok((socket, _)) => socket,
+        Err(e) => {
+            error!(
+                "WebSocket: Failed to connect to backend {} ({}): {}",
+                backend_label, backend_url, e
+            );
+            return;
+        }
+    };
+
+    info!(
+        "WebSocket: {} connected to backend {}",
+        client_addr, backend_label
+    );
+
+    // Split both connections
+    let (mut client_write, mut client_read) = client_socket.split();
+    let (mut backend_write, mut backend_read) = backend_socket.split();
+
+    // Forward client -> backend
+    let client_to_backend = async {
+        while let Some(msg) = client_read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if backend_write
+                        .send(TungsteniteMessage::Text(text))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Binary(data)) => {
+                    if backend_write
+                        .send(TungsteniteMessage::Binary(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Ping(data)) => {
+                    if backend_write
+                        .send(TungsteniteMessage::Ping(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Pong(data)) => {
+                    if backend_write
+                        .send(TungsteniteMessage::Pong(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+            }
+        }
+    };
+
+    // Forward backend -> client
+    let backend_to_client = async {
+        while let Some(msg) = backend_read.next().await {
+            match msg {
+                Ok(TungsteniteMessage::Text(text)) => {
+                    if client_write
+                        .send(Message::Text(text))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(TungsteniteMessage::Binary(data)) => {
+                    if client_write
+                        .send(Message::Binary(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(TungsteniteMessage::Ping(data)) => {
+                    if client_write
+                        .send(Message::Ping(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(TungsteniteMessage::Pong(data)) => {
+                    if client_write
+                        .send(Message::Pong(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(TungsteniteMessage::Close(_)) | Ok(TungsteniteMessage::Frame(_)) | Err(_) => {
+                    break
+                }
+            }
+        }
+    };
+
+    // Run both directions concurrently, stop when either ends
+    tokio::select! {
+        _ = client_to_backend => {},
+        _ = backend_to_client => {},
+    }
+
+    info!(
+        "WebSocket: {} disconnected from backend {}",
+        client_addr, backend_label
+    );
 }
