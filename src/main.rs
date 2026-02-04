@@ -99,23 +99,54 @@ async fn main() {
         .await;
     });
 
-    let app = Router::new()
+    // HTTP server (JSON-RPC over HTTP)
+    let http_app = Router::new()
         .route("/", post(proxy))
-        .route("/", get(ws_proxy))
         .route("/*path", post(proxy))
         .route("/health", get(health_endpoint))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(middleware::from_fn(log_requests))
         .layer(middleware::from_fn(extract_rpc_method));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    info!("Listening on http://{}", addr);
-    info!("Health monitoring endpoint: http://{}/health", addr);
+    // WebSocket server (following Solana convention: WS port = HTTP port + 1)
+    let ws_app = Router::new()
+        .route("/", get(ws_proxy))
+        .with_state(state)
+        .layer(middleware::from_fn(log_requests));
 
-    axum::serve(
-        tokio::net::TcpListener::bind(addr).await.unwrap(),
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
+    let http_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let ws_port = config
+        .port
+        .checked_add(1)
+        .expect("WebSocket port overflow: HTTP port cannot be 65535");
+    let ws_addr = SocketAddr::from(([0, 0, 0, 0], ws_port));
+
+    info!("HTTP server listening on http://{}", http_addr);
+    info!("WebSocket server listening on ws://{}", ws_addr);
+    info!("Health monitoring endpoint: http://{}/health", http_addr);
+
+    // Start both servers concurrently
+    let http_server = async {
+        axum::serve(
+            tokio::net::TcpListener::bind(http_addr)
+                .await
+                .expect("Failed to bind HTTP server"),
+            http_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("HTTP server error");
+    };
+
+    let ws_server = async {
+        axum::serve(
+            tokio::net::TcpListener::bind(ws_addr)
+                .await
+                .expect("Failed to bind WebSocket server"),
+            ws_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("WebSocket server error");
+    };
+
+    tokio::join!(http_server, ws_server);
 }

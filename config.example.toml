@@ -1,7 +1,9 @@
 # Example configuration for RPC Router
 # Copy this file to config.toml and customize
 
-# Server port
+# Server port (HTTP JSON-RPC)
+# WebSocket server automatically runs on port + 1 (Solana convention)
+# Example: port = 28899 -> HTTP on 28899, WebSocket on 28900
 port = 28899
 
 # API keys for authentication

@@ -26,7 +26,8 @@ The router uses a TOML configuration file specified via command-line argument.
 2. Edit `config.toml` with your settings:
 
    ```toml
-   # Server port
+   # Server port (HTTP JSON-RPC)
+   # WebSocket server automatically runs on port + 1 (Solana convention)
    port = 28899
 
    # API keys for authentication

@@ -115,11 +115,8 @@ impl AppState {
         }
 
         // Fallback
-        ws_backends.first().map(|b| {
-            (
-                b.label.as_str(),
-                b.ws_url.as_ref().unwrap().as_str(),
-            )
-        })
+        ws_backends
+            .first()
+            .map(|b| (b.label.as_str(), b.ws_url.as_ref().unwrap().as_str()))
     }
 }

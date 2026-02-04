@@ -368,38 +368,22 @@ async fn handle_ws_connection(
         while let Some(msg) = backend_read.next().await {
             match msg {
                 Ok(TungsteniteMessage::Text(text)) => {
-                    if client_write
-                        .send(Message::Text(text))
-                        .await
-                        .is_err()
-                    {
+                    if client_write.send(Message::Text(text)).await.is_err() {
                         break;
                     }
                 }
                 Ok(TungsteniteMessage::Binary(data)) => {
-                    if client_write
-                        .send(Message::Binary(data))
-                        .await
-                        .is_err()
-                    {
+                    if client_write.send(Message::Binary(data)).await.is_err() {
                         break;
                     }
                 }
                 Ok(TungsteniteMessage::Ping(data)) => {
-                    if client_write
-                        .send(Message::Ping(data))
-                        .await
-                        .is_err()
-                    {
+                    if client_write.send(Message::Ping(data)).await.is_err() {
                         break;
                     }
                 }
                 Ok(TungsteniteMessage::Pong(data)) => {
-                    if client_write
-                        .send(Message::Pong(data))
-                        .await
-                        .is_err()
-                    {
+                    if client_write.send(Message::Pong(data)).await.is_err() {
                         break;
                     }
                 }
