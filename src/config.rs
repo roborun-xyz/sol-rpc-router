@@ -1,11 +1,10 @@
-use std::{collections::HashMap, fs};
-
+use std::{collections::HashMap, fs, path::Path};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub port: u16,
-    pub api_keys: Vec<String>,
+    pub redis_url: String, // Added Redis URL
     pub backends: Vec<Backend>,
     #[serde(default)]
     pub method_routes: HashMap<String, String>,
@@ -58,30 +57,26 @@ pub struct Backend {
 }
 
 pub fn load_config(config_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    if !std::path::Path::new(config_path).exists() {
+    if !Path::new(config_path).exists() {
         return Err(format!("Configuration file not found: {}", config_path).into());
     }
 
-    // Read TOML file directly to preserve case sensitivity
     let contents = fs::read_to_string(config_path)?;
     let config: Config = toml::from_str(&contents)?;
 
-    // Validation
-    if config.api_keys.is_empty() {
-        return Err("At least one API key must be configured".into());
+    if config.redis_url.is_empty() {
+        return Err("Redis URL must be configured".into());
     }
     if config.backends.is_empty() {
         return Err("At least one backend must be configured".into());
     }
 
-    // Create a set of valid backend labels for validation
     let backend_labels: HashMap<String, String> = config
         .backends
         .iter()
         .map(|b| (b.label.clone(), b.url.clone()))
         .collect();
 
-    // Check for duplicate labels
     if backend_labels.len() != config.backends.len() {
         return Err("Duplicate backend labels found in configuration".into());
     }
@@ -99,7 +94,6 @@ pub fn load_config(config_path: &str) -> Result<Config, Box<dyn std::error::Erro
         return Err("Proxy timeout_secs must be > 0".into());
     }
 
-    // Validate method_routes reference valid backend labels
     for (method, label) in &config.method_routes {
         if !backend_labels.contains_key(label) {
             return Err(format!(

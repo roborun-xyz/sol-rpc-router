@@ -1,38 +1,11 @@
-# Example configuration for RPC Router
-# Copy this file to config.toml and customize
-
 # Server port (HTTP JSON-RPC)
 # WebSocket server automatically runs on port + 1 (Solana convention)
-# Example: port = 28899 -> HTTP on 28899, WebSocket on 28900
 port = 28899
 
-# API keys for authentication
-# Requests must include ?api-key=<key> in the query string
-api_keys = ["your-api-key-1", "your-api-key-2", "your-api-key-3"]
-
-# Health check configuration (optional - all fields have defaults)
-[health_check]
-interval_secs = 30                  # Check backends every 30 seconds
-timeout_secs = 5                    # Timeout for each health check request
-method = "getSlot"                  # JSON-RPC method to use for health checks
-consecutive_failures_threshold = 3  # Mark unhealthy after 3 consecutive failures
-consecutive_successes_threshold = 2 # Mark healthy after 2 consecutive successes
-
-# Proxy configuration (optional - all fields have defaults)
-[proxy]
-timeout_secs = 15 # Timeout for proxied upstream requests
+# Redis Connection URL
+redis_url = "redis://127.0.0.1:6379/0"
 
 # Backend RPC endpoints with weights
-# Weight determines the probability of selection for load balancing:
-# - Backend with weight 2 gets 2x more requests than weight 1
-# - Total weight = sum of all weights
-# - Probability = backend_weight / total_weight
-#
-# Example: With weights 2, 3, 1 (total=6):
-#   - First backend:  2/6 = 33.3% of requests
-#   - Second backend: 3/6 = 50.0% of requests
-#   - Third backend:  1/6 = 16.7% of requests
-
 [[backends]]
 label = "backend-0"
 url = "https://api.mainnet-beta.solana.com"
@@ -40,27 +13,19 @@ weight = 2
 
 [[backends]]
 label = "backend-1"
-url = "https://some-solana-rpc.com"
-weight = 3
-
-[[backends]]
-label = "backend-2"
-url = "https://another-solana-rpc.com"
+url = "https://solana-api.com"
 weight = 1
 
-# Method-specific routing overrides (optional)
-# Force certain RPC methods to always use a specific backend
-# This is useful for methods that work better on certain providers
-# or for cost optimization
-#
-# IMPORTANT: Method names are CASE-SENSITIVE and must match exactly
-# what appears in the JSON-RPC "method" field
-#
-# Uncomment and customize as needed:
+# Health check configuration (optional - has defaults)
+[health_check]
+interval_secs = 30              # Check every 30 seconds
+timeout_secs = 5                # 5 second timeout
+method = "getSlot"              # RPC method for health checks
+consecutive_failures_threshold = 3     # Mark unhealthy after 3 failures
+consecutive_successes_threshold = 2    # Mark healthy after 2 successes
 
+# Method-specific routing overrides (optional)
+# Use backend labels to route specific methods
 [method_routes]
-# Route transaction submissions to a specific high-performance backend
-# sendTransaction = "backend-1"
-# 
-# Route account queries to a different backend
-# getAccountInfo = "backend-2"
+getProgramAccountsV2 = "backend-0"
+sendTransaction = "backend-1"
