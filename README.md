@@ -1,161 +1,119 @@
 # RPC Router
 
-A high-performance HTTP router for Solana RPC requests with API key authentication, weighted load balancing, and method-based routing.
+A high-performance HTTP router for Solana RPC requests with Redis-backed API key authentication, rate limiting, weighted load balancing, and method-based routing.
 
 ## Features
 
-- **API Key Authentication**: Validates requests using query parameter `?api-key=`
-- **Weighted Load Balancing**: Distribute requests across multiple backends with configurable weights
-- **Method-Based Routing**: Route specific RPC methods to designated backends
-- **Health Checks**: Automatically monitor backend health and route around unhealthy backends
-- **Request Logging**: Logs request information including RPC method, path, client IP, and duration
-- **Health Monitoring**: GET /health endpoint for external monitoring tools
+- **API Key Authentication**: Validates requests using query parameter `?api-key=` against Redis.
+- **Rate Limiting**: Enforces per-key rate limits (requests per second) using Redis + local caching.
+- **Weighted Load Balancing**: Distribute requests across multiple backends with configurable weights.
+- **Method-Based Routing**: Route specific RPC methods to designated backends.
+- **Health Checks**: Automatically monitor backend health and route around unhealthy backends.
+- **Request Logging**: Logs request information including RPC method, path, client IP, and duration.
+- **Health Monitoring**: GET /health endpoint for external monitoring tools.
+
+## Prerequisites
+
+- **Redis**: Required for storing API keys and rate limiting counters.
 
 ## Configuration
 
-The router uses a TOML configuration file specified via command-line argument.
+The router uses a TOML configuration file.
 
-### TOML Configuration
-
-1. Copy the example configuration:
-
-   ```bash
-   cp config.example.toml config.toml
-   ```
-
-2. Edit `config.toml` with your settings:
+1. Create `config.toml`:
 
    ```toml
    # Server port (HTTP JSON-RPC)
-   # WebSocket server automatically runs on port + 1 (Solana convention)
+   # WebSocket server automatically runs on port + 1
    port = 28899
 
-   # API keys for authentication
-   api_keys = ["key1", "key2", "key3"]
+   # Redis Connection URL
+   redis_url = "redis://127.0.0.1:6379/0"
 
    # Backend RPC endpoints with weights
    [[backends]]
-   label = "backend-0"
+   label = "mainnet-beta"
    url = "https://api.mainnet-beta.solana.com"
-   weight = 2
+   weight = 10
 
    [[backends]]
-   label = "backend-1"
+   label = "backup-rpc"
    url = "https://solana-api.com"
-   weight = 1
+   weight = 5
 
-   # Health check configuration (optional - has defaults)
+   # Proxy settings
+   [proxy]
+   timeout_secs = 30
+
+   # Health check configuration
    [health_check]
-   interval_secs = 30              # Check every 30 seconds
-   timeout_secs = 5                # 5 second timeout
-   method = "getSlot"              # RPC method for health checks
-   consecutive_failures_threshold = 3     # Mark unhealthy after 3 failures
-   consecutive_successes_threshold = 2    # Mark healthy after 2 successes
-
-   # Method-specific routing overrides (optional)
-   # Use backend labels to route specific methods
-   [method_routes]
-   getProgramAccountsV2 = "backend-0"
-   sendTransaction = "backend-1"
+   interval_secs = 30
+   timeout_secs = 5
+   method = "getSlot"
    ```
 
-### Weighted Load Balancing
+## Key Management CLI
 
-Backends are selected randomly based on their configured weights:
+Use the built-in `rpc-admin` CLI to manage API keys.
 
-- **Weight 2**: Gets 2x more requests than weight 1
-- **Weight 3**: Gets 3x more requests than weight 1
-- **Example**: Weights [2, 3, 1] result in distribution [33.3%, 50%, 16.7%]
+**Build:**
+```bash
+cargo build --release --bin rpc-admin
+```
 
-### Method-Based Routing
+**Commands:**
 
-Override the weighted selection for specific RPC methods:
+1. **Create a Key**:
+   ```bash
+   # Create key for client-a with 600 req/min limit
+   ./target/release/rpc-admin create client-a --rate-limit 600
+   ```
 
-- Define method → backend label mappings in `[method_routes]`
-- Use backend labels to reference backends
-- **Method names are case-sensitive** - must match exactly what's in the JSON-RPC `"method"` field
-- Useful for routing expensive operations to specific providers
+2. **List Keys**:
+   ```bash
+   ./target/release/rpc-admin list
+   ```
 
-### Health Checks
+3. **Get Key Info**:
+   ```bash
+   ./target/release/rpc-admin inspect <api_key>
+   ```
 
-The router automatically monitors backend health:
+4. **Revoke Key**:
+   ```bash
+   ./target/release/rpc-admin revoke <api_key>
+   ```
 
-- **Periodic Checks**: Sends health check requests to all backends at configured intervals (default: 30s)
-- **Smart Routing**: Automatically excludes unhealthy backends from request routing
-- **Thresholds**: Backends are marked unhealthy after consecutive failures (default: 3) and healthy after consecutive successes (default: 2)
-- **Fallback Behavior**: Returns 503 Service Unavailable when all backends are unhealthy
-- **Configurable Method**: Uses `getSlot` by default (universally supported across Solana RPC providers)
+**Redis Configuration:**
+By default, `rpc-admin` connects to `redis://127.0.0.1:6379`.
+To change this, set the `REDIS_URL` environment variable or use the `--redis-url` flag:
 
-Health check configuration is optional. All fields have sensible defaults.
+```bash
+export REDIS_URL="redis://redis-host:6379"
+./target/release/rpc-admin list
+```
 
-## Usage
+## Running the Router
 
-1. Configure the router (see Configuration section above)
-
-2. Run the router with default config file (`config.toml`):
+1. Ensure Redis is running.
+2. Run the server:
 
    ```bash
-   cargo run --release
+   cargo run --release -- --config config.toml
    ```
 
-3. Or specify a custom config file:
-
-   ```bash
-   cargo run --release -- --config /path/to/custom-config.toml
-   # or short form:
-   cargo run --release -- -c /path/to/custom-config.toml
-   ```
-
-4. Make requests with your API key:
+3. Make requests:
 
    ```bash
    curl -X POST -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"getEpochInfo"}' \
-     "http://localhost:28899?api-key=your-api-key"
-   ```
-
-5. Use with Solana CLI:
-   ```bash
-   solana -u "http://localhost:28899?api-key=your-api-key" epoch-info
+     -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' \
+     "http://localhost:28899?api-key=YOUR_API_KEY"
    ```
 
 ## Health Monitoring
 
-The router exposes a GET `/health` endpoint for monitoring backend status:
+The `/health` endpoint exposes backend status:
 
 ```bash
-curl http://localhost:28899/health | jq
+curl http://localhost:28899/health
 ```
-
-Example response:
-```json
-{
-  "overall_status": "healthy",
-  "backends": [
-    {
-      "label": "backend-0",
-      "url": "https://api.mainnet-beta.solana.com",
-      "healthy": true,
-      "last_check": "SystemTime { tv_sec: 1234567890, tv_nsec: 123456789 }",
-      "consecutive_failures": 0,
-      "consecutive_successes": 5,
-      "last_error": null
-    },
-    {
-      "label": "backend-1",
-      "url": "https://solana-api.com",
-      "healthy": false,
-      "last_check": "SystemTime { tv_sec: 1234567890, tv_nsec: 987654321 }",
-      "consecutive_failures": 3,
-      "consecutive_successes": 0,
-      "last_error": "Health check timed out after 5s"
-    }
-  ]
-}
-```
-
-The `/health` endpoint:
-- Does not require API key authentication
-- Returns `overall_status` of "healthy" if any backend is healthy, "unhealthy" if all are unhealthy
-- Provides detailed status for each backend including failure counts and last error message
-- Can be integrated with monitoring tools like Prometheus, Datadog, or simple uptime monitors
