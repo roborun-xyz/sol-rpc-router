@@ -7,8 +7,8 @@ use std::{
 use axum::{body::Body, http::Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use tokio::time::{sleep, timeout, Duration};
 use metrics::gauge;
+use tokio::time::{sleep, timeout, Duration};
 
 use crate::config::{Backend, HealthCheckConfig};
 

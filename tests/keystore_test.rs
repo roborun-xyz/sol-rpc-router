@@ -1,5 +1,4 @@
-use sol_rpc_router::mock::MockKeyStore;
-use sol_rpc_router::keystore::KeyStore;
+use sol_rpc_router::{keystore::KeyStore, mock::MockKeyStore};
 
 #[tokio::test]
 async fn test_validate_key_valid() {
@@ -36,9 +35,13 @@ async fn test_validate_key_inactive() {
 async fn test_validate_key_rate_limit() {
     let store = MockKeyStore::new();
     store.add_key("limited-key", "owner3", 10);
-    
+
     // Simulate rate limit hit by manually adding to restricted list in MockKeyStore
-    store.rate_limited_keys.lock().unwrap().push("limited-key".to_string());
+    store
+        .rate_limited_keys
+        .lock()
+        .unwrap()
+        .push("limited-key".to_string());
 
     let result = store.validate_key("limited-key").await;
     assert!(result.is_err());

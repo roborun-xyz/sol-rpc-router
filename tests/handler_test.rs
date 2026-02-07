@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::Arc};
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -15,8 +17,6 @@ use sol_rpc_router::{
     mock::MockKeyStore,
     state::AppState,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
 use tower::ServiceExt; // for oneshot
 
 async fn start_mock_backend() -> String {
@@ -24,7 +24,10 @@ async fn start_mock_backend() -> String {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let app = Router::new().route("/", post(|| async { "{\"jsonrpc\":\"2.0\",\"result\":\"ok\",\"id\":1}" }));
+        let app = Router::new().route(
+            "/",
+            post(|| async { "{\"jsonrpc\":\"2.0\",\"result\":\"ok\",\"id\":1}" }),
+        );
         axum::serve(listener, app).await.unwrap();
     });
 
@@ -34,7 +37,7 @@ async fn start_mock_backend() -> String {
 #[tokio::test]
 async fn test_proxy_handler_success() {
     let backend_url = start_mock_backend().await;
-    
+
     let https = HttpsConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
@@ -70,13 +73,15 @@ async fn test_proxy_handler_success() {
         .method("POST")
         .uri("/?api-key=test-key")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#))
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#,
+        ))
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    
+
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body_str = String::from_utf8(body.to_vec()).unwrap();
     assert!(body_str.contains("result"));
@@ -123,7 +128,11 @@ async fn test_proxy_handler_rate_limited() {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
     keystore.add_key("limit-key", "tester", 10);
-    keystore.rate_limited_keys.lock().unwrap().push("limit-key".to_string());
+    keystore
+        .rate_limited_keys
+        .lock()
+        .unwrap()
+        .push("limit-key".to_string());
 
     let health_state = Arc::new(HealthState::new(vec![]));
     let state = Arc::new(AppState {

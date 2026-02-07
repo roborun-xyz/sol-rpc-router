@@ -1,8 +1,8 @@
-use clap::{Parser, Subcommand};
-use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use clap::{Parser, Subcommand};
 use rand::{distributions::Alphanumeric, Rng};
+use redis::AsyncCommands;
 
 #[derive(Parser)]
 #[command(name = "rpc-admin")]
@@ -30,24 +30,11 @@ enum Commands {
         expires_at: Option<u64>,
     },
     /// Revoke an API key
-    Revoke {
-        key: String,
-    },
+    Revoke { key: String },
     /// List all API keys
     List,
     /// Inspect an API key
-    Inspect {
-        key: String,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct KeyMetadata {
-    owner: String,
-    active: bool,
-    created_at: u64,
-    expires_at: Option<u64>,
-    rate_limit: u64,
+    Inspect { key: String },
 }
 
 #[tokio::main]
@@ -67,12 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .take(32)
                 .map(char::from)
                 .collect();
-            
+
             let redis_key = format!("api_key:{}", key);
-            
-            let created_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_secs();
+
+            let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
             let mut pipe = redis::pipe();
             pipe.atomic()
@@ -84,9 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(exp) = expires_at {
                 pipe.hset(&redis_key, "expires_at", exp);
             }
-            
+
             let _: () = pipe.query_async(&mut con).await?;
-            
+
             // Also store in a set for listing
             let _: () = con.sadd("api_keys_index", &key).await?;
 
@@ -96,8 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Revoke { key } => {
             let redis_key = format!("api_key:{}", key);
             // Check existence first
-            let exists: bool = redis::cmd("EXISTS").arg(&redis_key).query_async(&mut con).await?;
-            
+            let exists: bool = redis::cmd("EXISTS")
+                .arg(&redis_key)
+                .query_async(&mut con)
+                .await?;
+
             if exists {
                 // Set active=false
                 let _: () = con.hset(&redis_key, "active", "false").await?;
@@ -115,9 +103,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let redis_key = format!("api_key:{}", key);
                 let owner: Option<String> = con.hget(&redis_key, "owner").await?;
                 let active: Option<String> = con.hget(&redis_key, "active").await?;
-                
+
                 if let Some(o) = owner {
-                    println!("- {} [owner={}] [active={}]", key, o, active.unwrap_or("true".to_string()));
+                    println!(
+                        "- {} [owner={}] [active={}]",
+                        key,
+                        o,
+                        active.unwrap_or("true".to_string())
+                    );
                 } else {
                     println!("- {} [missing metadata]", key);
                 }
@@ -125,14 +118,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Inspect { key } => {
             let redis_key = format!("api_key:{}", key);
-            let exists: bool = redis::cmd("EXISTS").arg(&redis_key).query_async(&mut con).await?;
-            
+            let exists: bool = redis::cmd("EXISTS")
+                .arg(&redis_key)
+                .query_async(&mut con)
+                .await?;
+
             if exists {
                 let owner: String = con.hget(&redis_key, "owner").await.unwrap_or_default();
                 let rate_limit: u64 = con.hget(&redis_key, "rate_limit").await.unwrap_or(0);
-                let active: String = con.hget(&redis_key, "active").await.unwrap_or("true".to_string());
+                let active: String = con
+                    .hget(&redis_key, "active")
+                    .await
+                    .unwrap_or("true".to_string());
                 let created_at: u64 = con.hget(&redis_key, "created_at").await.unwrap_or(0);
-                
+
                 println!("Key: {}", key);
                 println!("Owner: {}", owner);
                 println!("Active: {}", active);

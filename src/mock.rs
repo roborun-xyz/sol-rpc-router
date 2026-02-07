@@ -1,6 +1,10 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+
 use crate::keystore::{KeyInfo, KeyStore};
 
 #[derive(Clone)]
@@ -46,24 +50,34 @@ impl KeyStore for MockKeyStore {
         let mut counts = self.call_counts.lock().unwrap();
         *counts.entry(key.to_string()).or_insert(0) += 1;
 
-        if self.inactive_keys.lock().unwrap().contains(&key.to_string()) {
+        if self
+            .inactive_keys
+            .lock()
+            .unwrap()
+            .contains(&key.to_string())
+        {
             return Ok(None);
         }
 
         if let Some(info) = self.keys.lock().unwrap().get(key) {
             // Check rate limit (simple check against strict list for testing)
-            if self.rate_limited_keys.lock().unwrap().contains(&key.to_string()) {
+            if self
+                .rate_limited_keys
+                .lock()
+                .unwrap()
+                .contains(&key.to_string())
+            {
                 return Err("Rate limit exceeded".to_string());
             }
-            
+
             // Also check implied rate limit if we tracked time, but for mock, we trust the explicit list
             // or we could implement a counter reset. For simplicity, let's assume we manually trigger limit.
-            
+
             // Actually, let's implement the logic requested:
             // "Test validate_key scenarios: ... rate limit exceeded"
             // If the mock needs to simulate dynamic rate limiting, we need timestamps.
             // But usually mocks are configured.
-            
+
             return Ok(Some(info.clone()));
         }
 

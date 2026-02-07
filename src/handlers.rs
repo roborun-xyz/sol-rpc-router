@@ -12,11 +12,11 @@ use axum::{
     Json,
 };
 use futures_util::{SinkExt, StreamExt};
+use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 use tracing::{error, info, warn};
-use metrics::{counter, histogram};
 
 use crate::state::AppState;
 
@@ -96,16 +96,24 @@ pub async fn log_requests(
 pub async fn track_metrics(req: Request<Body>, next: Next) -> Response {
     let start = std::time::Instant::now();
     let method = req.method().to_string();
-    
+
     // Try to get RPC method if already extracted
-    let rpc_method = req.extensions().get::<RpcMethod>().map(|m| m.0.clone()).unwrap_or_else(|| "unknown".to_string());
+    let rpc_method = req
+        .extensions()
+        .get::<RpcMethod>()
+        .map(|m| m.0.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
     let response = next.run(req).await;
-    
+
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
-    
-    let backend = response.extensions().get::<SelectedBackend>().map(|b| b.0.clone()).unwrap_or_else(|| "none".to_string());
+
+    let backend = response
+        .extensions()
+        .get::<SelectedBackend>()
+        .map(|b| b.0.clone())
+        .unwrap_or_else(|| "none".to_string());
 
     histogram!("rpc_request_duration_seconds").record(duration);
     counter!("rpc_requests_total", "method" => method, "status" => status, "rpc_method" => rpc_method, "backend" => backend).increment(1);
@@ -140,7 +148,8 @@ pub async fn proxy(
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
             } else {
                 error!("Key validation error: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+                    .into_response();
             }
         }
     }
@@ -185,13 +194,17 @@ pub async fn proxy(
     } else {
         format!("{}{}", backend_url, cleaned_request_path)
     };
-    
+
     // Ensure we have a valid URI
     let parsed_uri = match uri_string.parse::<Uri>() {
         Ok(uri) => uri,
         Err(e) => {
-             error!("Failed to parse backend URI '{}': {}", uri_string, e);
-             return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid backend configuration").into_response();
+            error!("Failed to parse backend URI '{}': {}", uri_string, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid backend configuration",
+            )
+                .into_response();
         }
     };
 
@@ -314,11 +327,14 @@ pub async fn ws_proxy(
         }
         Err(e) => {
             if e == "Rate limit exceeded" {
-                 warn!("WebSocket: API key '{}' rate limited from {}", api_key, addr);
-                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+                warn!(
+                    "WebSocket: API key '{}' rate limited from {}",
+                    api_key, addr
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
             }
-             error!("WebSocket: Key validation error: {}", e);
-             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
+            error!("WebSocket: Key validation error: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
         }
     }
 

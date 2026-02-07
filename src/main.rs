@@ -8,16 +8,15 @@ use axum::{
 use clap::Parser;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
-use tracing::{info, error};
 use metrics_exporter_prometheus::PrometheusBuilder;
-
 use sol_rpc_router::{
     config::load_config,
-    handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, ws_proxy, track_metrics},
+    handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, track_metrics, ws_proxy},
     health::{health_check_loop, HealthState},
     keystore::RedisKeyStore,
     state::AppState,
 };
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "rpc-router")]
@@ -34,7 +33,9 @@ async fn main() {
 
     // Initialize Prometheus recorder
     let builder = PrometheusBuilder::new();
-    let handle = builder.install_recorder().expect("failed to install Prometheus recorder");
+    let handle = builder
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
 
     // Parse command-line arguments
     let args = Args::parse();
@@ -44,7 +45,7 @@ async fn main() {
 
     info!("Loaded configuration from: {}", args.config);
     info!("Redis URL configured: {}", config.redis_url);
-    
+
     info!("Loaded {} backends", config.backends.len());
     for backend in &config.backends {
         info!(
