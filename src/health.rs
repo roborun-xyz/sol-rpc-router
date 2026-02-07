@@ -8,6 +8,7 @@ use axum::{body::Body, http::Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use tokio::time::{sleep, timeout, Duration};
+use metrics::gauge;
 
 use crate::config::{Backend, HealthCheckConfig};
 
@@ -184,6 +185,10 @@ pub async fn health_check_loop(
                     current_status.consecutive_successes
                 );
             }
+
+            // Update metrics
+            gauge!("rpc_backend_health", "backend" => backend.label.clone())
+                .set(if current_status.healthy { 1.0 } else { 0.0 });
 
             // Update state
             health_state.update_status(&backend.label, current_status);

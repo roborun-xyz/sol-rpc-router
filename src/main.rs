@@ -1,8 +1,3 @@
-mod config;
-mod handlers;
-mod health;
-mod state;
-
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -11,13 +6,18 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use config::load_config;
-use handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, ws_proxy};
-use health::{health_check_loop, HealthState};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
-use state::AppState;
-use tracing::info;
+use tracing::{info, error};
+use metrics_exporter_prometheus::PrometheusBuilder;
+
+use sol_rpc_router::{
+    config::load_config,
+    handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, ws_proxy, track_metrics},
+    health::{health_check_loop, HealthState},
+    keystore::RedisKeyStore,
+    state::AppState,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "rpc-router")]
@@ -32,6 +32,10 @@ struct Args {
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    // Initialize Prometheus recorder
+    let builder = PrometheusBuilder::new();
+    let handle = builder.install_recorder().expect("failed to install Prometheus recorder");
+
     // Parse command-line arguments
     let args = Args::parse();
 
@@ -39,6 +43,8 @@ async fn main() {
     let config = load_config(&args.config).expect("Failed to load router configuration");
 
     info!("Loaded configuration from: {}", args.config);
+    info!("Redis URL configured: {}", config.redis_url);
+    
     info!("Loaded {} backends", config.backends.len());
     for backend in &config.backends {
         info!(
@@ -68,10 +74,19 @@ async fn main() {
     let https = HttpsConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
 
+    // Initialize Redis KeyStore
+    let keystore = match RedisKeyStore::new(&config.redis_url) {
+        Ok(ks) => ks,
+        Err(e) => {
+            error!("Failed to initialize Redis KeyStore: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     let state = Arc::new(AppState {
         client: client.clone(),
         backends: config.backends.clone(),
-        api_keys: config.api_keys,
+        keystore: Arc::new(keystore),
         method_routes: config.method_routes,
         label_to_url,
         health_state: health_state.clone(),
@@ -104,7 +119,9 @@ async fn main() {
         .route("/", post(proxy))
         .route("/*path", post(proxy))
         .route("/health", get(health_endpoint))
+        .route("/metrics", get(move || std::future::ready(handle.render())))
         .with_state(state.clone())
+        .layer(middleware::from_fn(track_metrics))
         .layer(middleware::from_fn(log_requests))
         .layer(middleware::from_fn(extract_rpc_method));
 
@@ -124,6 +141,7 @@ async fn main() {
     info!("HTTP server listening on http://{}", http_addr);
     info!("WebSocket server listening on ws://{}", ws_addr);
     info!("Health monitoring endpoint: http://{}/health", http_addr);
+    info!("Metrics endpoint: http://{}/metrics", http_addr);
 
     // Start both servers concurrently
     let http_server = async {

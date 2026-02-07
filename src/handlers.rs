@@ -15,7 +15,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use metrics::{counter, histogram};
 
 use crate::state::AppState;
 
@@ -92,20 +93,55 @@ pub async fn log_requests(
     response
 }
 
+pub async fn track_metrics(req: Request<Body>, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let method = req.method().to_string();
+    
+    // Try to get RPC method if already extracted
+    let rpc_method = req.extensions().get::<RpcMethod>().map(|m| m.0.clone()).unwrap_or_else(|| "unknown".to_string());
+
+    let response = next.run(req).await;
+    
+    let duration = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+    
+    let backend = response.extensions().get::<SelectedBackend>().map(|b| b.0.clone()).unwrap_or_else(|| "none".to_string());
+
+    histogram!("rpc_request_duration_seconds").record(duration);
+    counter!("rpc_requests_total", "method" => method, "status" => status, "rpc_method" => rpc_method, "backend" => backend).increment(1);
+
+    response
+}
+
 pub async fn proxy(
     State(state): State<Arc<AppState>>,
     Query(params): Query<Params>,
     mut req: Request<Body>,
 ) -> impl IntoResponse {
-    match params.api_key {
-        Some(ref key) if state.api_keys.contains(key) => {}
-        Some(ref key) => {
-            info!("API key '{}' is invalid", key);
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-        }
+    let api_key = match params.api_key {
+        Some(k) => k,
         None => {
             info!("No API key provided");
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    };
+
+    match state.keystore.validate_key(&api_key).await {
+        Ok(Some(_info)) => {
+            // Valid key
+        }
+        Ok(None) => {
+            info!("API key '{}' is invalid", api_key);
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+        Err(e) => {
+            if e == "Rate limit exceeded" {
+                warn!("API key '{}' rate limited", api_key);
+                return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+            } else {
+                error!("Key validation error: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
+            }
         }
     }
 
@@ -149,7 +185,15 @@ pub async fn proxy(
     } else {
         format!("{}{}", backend_url, cleaned_request_path)
     };
-    let parsed_uri = uri_string.parse::<Uri>().unwrap();
+    
+    // Ensure we have a valid URI
+    let parsed_uri = match uri_string.parse::<Uri>() {
+        Ok(uri) => uri,
+        Err(e) => {
+             error!("Failed to parse backend URI '{}': {}", uri_string, e);
+             return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid backend configuration").into_response();
+        }
+    };
 
     // Update Host header to match the backend
     if let Some(host) = parsed_uri.host() {
@@ -251,16 +295,30 @@ pub async fn ws_proxy(
     Query(params): Query<Params>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    // Validate API key
-    match params.api_key {
-        Some(ref key) if state.api_keys.contains(key) => {}
-        Some(ref key) => {
-            info!("WebSocket: API key '{}' is invalid from {}", key, addr);
-            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-        }
+    let api_key = match params.api_key {
+        Some(k) => k,
         None => {
             info!("WebSocket: No API key provided from {}", addr);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    };
+
+    // Validate API key
+    match state.keystore.validate_key(&api_key).await {
+        Ok(Some(_)) => {
+            // Authorized
+        }
+        Ok(None) => {
+            info!("WebSocket: API key '{}' is invalid from {}", api_key, addr);
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+        Err(e) => {
+            if e == "Rate limit exceeded" {
+                 warn!("WebSocket: API key '{}' rate limited from {}", api_key, addr);
+                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+            }
+             error!("WebSocket: Key validation error: {}", e);
+             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
         }
     }
 

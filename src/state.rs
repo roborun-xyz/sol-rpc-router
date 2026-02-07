@@ -6,13 +6,13 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use rand::Rng;
 use tracing::info;
 
-use crate::{config::Backend, health::HealthState};
+use crate::{config::Backend, health::HealthState, keystore::KeyStore};
 
 #[derive(Clone)]
 pub struct AppState {
     pub client: Client<HttpsConnector<HttpConnector>, Body>,
     pub backends: Vec<Backend>,
-    pub api_keys: Vec<String>,
+    pub keystore: Arc<dyn KeyStore>,
     pub method_routes: HashMap<String, String>,
     pub label_to_url: HashMap<String, String>,
     pub health_state: Arc<HealthState>,
@@ -59,6 +59,12 @@ impl AppState {
 
         // Calculate total weight of healthy backends
         let healthy_total_weight: u32 = healthy_backends.iter().map(|b| b.weight).sum();
+
+        if healthy_total_weight == 0 {
+            return healthy_backends
+                .first()
+                .map(|b| (b.label.as_str(), b.url.as_str()));
+        }
 
         // Weighted random selection among healthy backends
         let mut rng = rand::thread_rng();
