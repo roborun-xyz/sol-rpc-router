@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
+use std::sync::atomic::AtomicBool;
 
 use axum::{
     body::Body,
@@ -15,7 +16,7 @@ use sol_rpc_router::{
     handlers::{extract_rpc_method, health_endpoint, proxy, RpcMethod},
     health::{BackendHealthStatus, HealthState},
     mock::MockKeyStore,
-    state::AppState,
+    state::{AppState, RuntimeBackend},
 };
 use tower::ServiceExt; // for oneshot
 
@@ -50,16 +51,18 @@ async fn test_proxy_handler_success() {
         weight: 100,
     };
 
+    let runtime_backend = RuntimeBackend {
+        config: backend,
+        healthy: Arc::new(AtomicBool::new(true)),
+    };
+
     let health_state = Arc::new(HealthState::new(vec!["mock-backend".to_string()]));
-    let mut label_to_url = HashMap::new();
-    label_to_url.insert("mock-backend".to_string(), backend_url);
 
     let state = Arc::new(AppState {
         client,
-        backends: vec![backend],
+        backends: vec![runtime_backend],
         keystore,
         method_routes: HashMap::new(),
-        label_to_url,
         health_state,
         proxy_timeout_secs: 5,
     });
@@ -100,7 +103,6 @@ async fn test_proxy_handler_unauthorized() {
         backends: vec![],
         keystore,
         method_routes: HashMap::new(),
-        label_to_url: HashMap::new(),
         health_state,
         proxy_timeout_secs: 5,
     });
@@ -140,7 +142,6 @@ async fn test_proxy_handler_rate_limited() {
         backends: vec![],
         keystore,
         method_routes: HashMap::new(),
-        label_to_url: HashMap::new(),
         health_state,
         proxy_timeout_secs: 5,
     });
@@ -176,7 +177,6 @@ async fn test_proxy_no_api_key() {
         backends: vec![],
         keystore,
         method_routes: HashMap::new(),
-        label_to_url: HashMap::new(),
         health_state,
         proxy_timeout_secs: 5,
     });
@@ -211,7 +211,6 @@ async fn test_proxy_keystore_internal_error() {
         backends: vec![],
         keystore,
         method_routes: HashMap::new(),
-        label_to_url: HashMap::new(),
         health_state,
         proxy_timeout_secs: 5,
     });
@@ -248,20 +247,20 @@ async fn test_proxy_no_healthy_backends() {
         weight: 1,
     };
 
-    let health_state = Arc::new(HealthState::new(vec!["sick-backend".to_string()]));
-    let mut unhealthy = BackendHealthStatus::default();
-    unhealthy.healthy = false;
-    health_state.update_status("sick-backend", unhealthy);
+    let runtime_backend = RuntimeBackend {
+        config: backend,
+        healthy: Arc::new(AtomicBool::new(false)), // Start unhealthy
+    };
 
-    let mut label_to_url = HashMap::new();
-    label_to_url.insert("sick-backend".to_string(), backend_url);
+    let health_state = Arc::new(HealthState::new(vec!["sick-backend".to_string()]));
+    // Note: HealthState is for the background loop, RuntimeBackend.healthy is for the hot path.
+    // In this test we manually set the atomic boolean.
 
     let state = Arc::new(AppState {
         client,
-        backends: vec![backend],
+        backends: vec![runtime_backend],
         keystore,
         method_routes: HashMap::new(),
-        label_to_url,
         health_state,
         proxy_timeout_secs: 5,
     });
@@ -290,17 +289,20 @@ fn make_health_state(backends: &[Backend]) -> Arc<AppState> {
     let keystore = Arc::new(MockKeyStore::new());
     let labels: Vec<String> = backends.iter().map(|b| b.label.clone()).collect();
     let health_state = Arc::new(HealthState::new(labels));
-    let label_to_url = backends
+
+    let runtime_backends = backends
         .iter()
-        .map(|b| (b.label.clone(), b.url.clone()))
+        .map(|b| RuntimeBackend {
+            config: b.clone(),
+            healthy: Arc::new(AtomicBool::new(true)),
+        })
         .collect();
 
     Arc::new(AppState {
         client,
-        backends: backends.to_vec(),
+        backends: runtime_backends,
         keystore,
         method_routes: HashMap::new(),
-        label_to_url,
         health_state,
         proxy_timeout_secs: 5,
     })
@@ -348,6 +350,11 @@ async fn test_health_endpoint_all_healthy() {
 #[tokio::test]
 async fn test_health_endpoint_mixed() {
     let state = make_health_state(&test_backends());
+
+    // Update AtomicBool for the hot path (not used by health_endpoint directly, but good practice)
+    // Actually health_endpoint reads from HealthState (RwLock), not AtomicBool.
+    // The health check loop updates both.
+    // So for this test we update HealthState.
     let mut unhealthy = BackendHealthStatus::default();
     unhealthy.healthy = false;
     state.health_state.update_status("b", unhealthy);
