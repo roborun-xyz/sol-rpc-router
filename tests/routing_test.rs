@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
@@ -6,7 +7,7 @@ use sol_rpc_router::{
     config::Backend,
     health::{BackendHealthStatus, HealthState},
     mock::MockKeyStore,
-    state::AppState,
+    state::{AppState, RuntimeBackend},
 };
 
 fn create_test_state() -> AppState {
@@ -14,7 +15,7 @@ fn create_test_state() -> AppState {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
 
-    let backends = vec![
+    let backend_configs = vec![
         Backend {
             label: "primary".to_string(),
             url: "http://primary".to_string(),
@@ -29,19 +30,22 @@ fn create_test_state() -> AppState {
         },
     ];
 
-    let backend_labels = backends.iter().map(|b| b.label.clone()).collect();
-    let health_state = Arc::new(HealthState::new(backend_labels));
-    let label_to_url = backends
+    let backends = backend_configs
         .iter()
-        .map(|b| (b.label.clone(), b.url.clone()))
+        .map(|b| RuntimeBackend {
+            config: b.clone(),
+            healthy: Arc::new(AtomicBool::new(true)),
+        })
         .collect();
+
+    let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
+    let health_state = Arc::new(HealthState::new(backend_labels));
 
     AppState {
         client,
         backends,
         keystore,
         method_routes: HashMap::new(),
-        label_to_url,
         health_state,
         proxy_timeout_secs: 10,
     }
@@ -50,8 +54,8 @@ fn create_test_state() -> AppState {
 #[test]
 fn test_select_backend_weighted() {
     let mut state = create_test_state();
-    state.backends[0].weight = 1;
-    state.backends[1].weight = 1;
+    state.backends[0].config.weight = 1;
+    state.backends[1].config.weight = 1;
 
     let iterations = 1000;
     let mut primary_count = 0;
@@ -84,9 +88,6 @@ fn test_select_backend_method_override() {
     let (label, _) = state.select_backend(Some("eth_blockNumber")).unwrap();
     let label_str = label.to_string(); // Clone to drop borrow
 
-    // We shouldn't modify the backends on the same state instance if we want to be safe with borrows,
-    // but here we just cloned the string.
-
     // Re-setup effectively by just checking the logic directly
     // With weight 0 for secondary in create_test_state, it should be primary
     assert_eq!(label_str, "primary");
@@ -95,7 +96,10 @@ fn test_select_backend_method_override() {
 #[test]
 fn test_select_backend_unhealthy_fallback() {
     let state = create_test_state();
-    // Mark primary as unhealthy
+    // Mark primary as unhealthy (update AtomicBool directly for hot path)
+    state.backends[0].healthy.store(false, Ordering::Relaxed);
+    
+    // Also update health_state for consistency (though select_backend uses AtomicBool)
     let mut status = BackendHealthStatus::default();
     status.healthy = false;
     state.health_state.update_status("primary", status);
@@ -107,11 +111,10 @@ fn test_select_backend_unhealthy_fallback() {
 #[test]
 fn test_select_backend_all_unhealthy() {
     let state = create_test_state();
-    for label in &["primary", "secondary"] {
-        let mut status = BackendHealthStatus::default();
-        status.healthy = false;
-        state.health_state.update_status(label, status);
+    for backend in &state.backends {
+        backend.healthy.store(false, Ordering::Relaxed);
     }
+    
     assert!(state.select_backend(None).is_none());
 }
 
@@ -122,7 +125,7 @@ fn create_ws_test_state() -> AppState {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
 
-    let backends = vec![
+    let backend_configs = vec![
         Backend {
             label: "ws-a".to_string(),
             url: "http://ws-a".to_string(),
@@ -137,19 +140,22 @@ fn create_ws_test_state() -> AppState {
         },
     ];
 
-    let backend_labels = backends.iter().map(|b| b.label.clone()).collect();
-    let health_state = Arc::new(HealthState::new(backend_labels));
-    let label_to_url = backends
+    let backends = backend_configs
         .iter()
-        .map(|b| (b.label.clone(), b.url.clone()))
+        .map(|b| RuntimeBackend {
+            config: b.clone(),
+            healthy: Arc::new(AtomicBool::new(true)),
+        })
         .collect();
+
+    let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
+    let health_state = Arc::new(HealthState::new(backend_labels));
 
     AppState {
         client,
         backends,
         keystore,
         method_routes: HashMap::new(),
-        label_to_url,
         health_state,
         proxy_timeout_secs: 10,
     }
@@ -184,9 +190,9 @@ fn test_select_ws_backend_no_ws_urls() {
 #[test]
 fn test_select_ws_backend_unhealthy_excluded() {
     let state = create_ws_test_state();
-    let mut unhealthy = BackendHealthStatus::default();
-    unhealthy.healthy = false;
-    state.health_state.update_status("ws-a", unhealthy);
+    
+    // Mark ws-a as unhealthy via AtomicBool
+    state.backends[0].healthy.store(false, Ordering::Relaxed);
 
     for _ in 0..100 {
         let (label, _) = state.select_ws_backend().unwrap();
