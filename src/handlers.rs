@@ -29,6 +29,11 @@ pub struct RpcMethod(pub String);
 pub struct SelectedBackend(pub String);
 
 #[derive(Deserialize)]
+struct MethodProbe<'a> {
+    method: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
 pub struct Params {
     #[serde(rename = "api-key")]
     pub api_key: Option<String>,
@@ -45,9 +50,11 @@ pub async fn extract_rpc_method(mut req: Request<Body>, next: Next) -> Response 
         }
     };
 
-    // Try to extract "method" from JSON
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-        if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
+    // Optimize: Partial Zero-Copy Deserialization
+    // Instead of parsing the full JSON (which allocates for params),
+    // we use a struct that only captures 'method' and borrows the string from the buffer.
+    if let Ok(probe) = serde_json::from_slice::<MethodProbe>(&body_bytes) {
+        if let Some(method) = probe.method {
             req = Request::from_parts(parts, Body::from(body_bytes.clone()));
             req.extensions_mut().insert(RpcMethod(method.to_string()));
             return next.run(req).await;
@@ -274,7 +281,7 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRes
 
     for backend in &state.backends {
         let status = all_statuses
-            .get(&backend.label)
+            .get(&backend.config.label)
             .cloned()
             .unwrap_or_default();
 
@@ -283,7 +290,7 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRes
         }
 
         backends.push(BackendHealth {
-            label: backend.label.clone(),
+            label: backend.config.label.clone(),
             healthy: status.healthy,
             last_check: status.last_check_time.map(|t| format!("{:?}", t)),
             consecutive_failures: status.consecutive_failures,
