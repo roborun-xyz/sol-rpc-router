@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use axum::body::Body;
 use hyper_tls::HttpsConnector;
@@ -8,13 +14,18 @@ use tracing::info;
 
 use crate::{config::Backend, health::HealthState, keystore::KeyStore};
 
+#[derive(Debug, Clone)]
+pub struct RuntimeBackend {
+    pub config: Backend,
+    pub healthy: Arc<AtomicBool>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub client: Client<HttpsConnector<HttpConnector>, Body>,
-    pub backends: Vec<Backend>,
+    pub backends: Vec<RuntimeBackend>,
     pub keystore: Arc<dyn KeyStore>,
     pub method_routes: HashMap<String, String>,
-    pub label_to_url: HashMap<String, String>,
     pub health_state: Arc<HealthState>,
     pub proxy_timeout_secs: u64,
 }
@@ -24,33 +35,30 @@ impl AppState {
         // Check method-specific routing first
         if let Some(method) = rpc_method {
             if let Some(backend_label) = self.method_routes.get(method) {
-                if let Some(backend_url) = self.label_to_url.get(backend_label) {
-                    // Check if method-routed backend is healthy
-                    if let Some(status) = self.health_state.get_status(backend_label) {
-                        if status.healthy {
-                            info!("Method {} routed to label={}", method, backend_label);
-                            return Some((backend_label, backend_url));
-                        } else {
-                            info!(
-                                "Method {} routed to label={} but backend is unhealthy, falling back to weighted selection",
-                                method, backend_label
-                            );
-                        }
+                // Find the backend by label to check its atomic health
+                if let Some(backend) = self
+                    .backends
+                    .iter()
+                    .find(|b| b.config.label == *backend_label)
+                {
+                    if backend.healthy.load(Ordering::Relaxed) {
+                        info!("Method {} routed to label={}", method, backend_label);
+                        return Some((&backend.config.label, &backend.config.url));
+                    } else {
+                        info!(
+                            "Method {} routed to label={} but backend is unhealthy, falling back to weighted selection",
+                            method, backend_label
+                        );
                     }
                 }
             }
         }
 
-        // Filter out unhealthy backends
-        let healthy_backends: Vec<&Backend> = self
+        // Filter out unhealthy backends (lock-free)
+        let healthy_backends: Vec<&RuntimeBackend> = self
             .backends
             .iter()
-            .filter(|b| {
-                self.health_state
-                    .get_status(&b.label)
-                    .map(|s| s.healthy)
-                    .unwrap_or(true) // Default to healthy if status not found
-            })
+            .filter(|b| b.healthy.load(Ordering::Relaxed))
             .collect();
 
         if healthy_backends.is_empty() {
@@ -58,12 +66,12 @@ impl AppState {
         }
 
         // Calculate total weight of healthy backends
-        let healthy_total_weight: u32 = healthy_backends.iter().map(|b| b.weight).sum();
+        let healthy_total_weight: u32 = healthy_backends.iter().map(|b| b.config.weight).sum();
 
         if healthy_total_weight == 0 {
             return healthy_backends
                 .first()
-                .map(|b| (b.label.as_str(), b.url.as_str()));
+                .map(|b| (b.config.label.as_str(), b.config.url.as_str()));
         }
 
         // Weighted random selection among healthy backends
@@ -71,32 +79,25 @@ impl AppState {
         let mut random_weight = rng.gen_range(0..healthy_total_weight);
 
         for backend in &healthy_backends {
-            if random_weight < backend.weight {
-                return Some((&backend.label, &backend.url));
+            if random_weight < backend.config.weight {
+                return Some((&backend.config.label, &backend.config.url));
             }
-            random_weight -= backend.weight;
+            random_weight -= backend.config.weight;
         }
 
         // Fallback (should never reach here if weights are valid)
         healthy_backends
             .first()
-            .map(|b| (b.label.as_str(), b.url.as_str()))
+            .map(|b| (b.config.label.as_str(), b.config.url.as_str()))
     }
 
     /// Select a healthy backend that has WebSocket support (ws_url configured)
     pub fn select_ws_backend(&self) -> Option<(&str, &str)> {
-        // Filter to backends with ws_url configured and healthy
-        let ws_backends: Vec<&Backend> = self
+        // Filter to backends with ws_url configured and healthy (lock-free)
+        let ws_backends: Vec<&RuntimeBackend> = self
             .backends
             .iter()
-            .filter(|b| {
-                b.ws_url.is_some()
-                    && self
-                        .health_state
-                        .get_status(&b.label)
-                        .map(|s| s.healthy)
-                        .unwrap_or(true)
-            })
+            .filter(|b| b.config.ws_url.is_some() && b.healthy.load(Ordering::Relaxed))
             .collect();
 
         if ws_backends.is_empty() {
@@ -104,25 +105,28 @@ impl AppState {
         }
 
         // Calculate total weight of WebSocket-capable backends
-        let total_weight: u32 = ws_backends.iter().map(|b| b.weight).sum();
+        let total_weight: u32 = ws_backends.iter().map(|b| b.config.weight).sum();
 
         // Weighted random selection
         let mut rng = rand::thread_rng();
         let mut random_weight = rng.gen_range(0..total_weight);
 
         for backend in &ws_backends {
-            if random_weight < backend.weight {
+            if random_weight < backend.config.weight {
                 return Some((
-                    backend.label.as_str(),
-                    backend.ws_url.as_ref().unwrap().as_str(),
+                    backend.config.label.as_str(),
+                    backend.config.ws_url.as_ref().unwrap().as_str(),
                 ));
             }
-            random_weight -= backend.weight;
+            random_weight -= backend.config.weight;
         }
 
         // Fallback
-        ws_backends
-            .first()
-            .map(|b| (b.label.as_str(), b.ws_url.as_ref().unwrap().as_str()))
+        ws_backends.first().map(|b| {
+            (
+                b.config.label.as_str(),
+                b.config.ws_url.as_ref().unwrap().as_str(),
+            )
+        })
     }
 }

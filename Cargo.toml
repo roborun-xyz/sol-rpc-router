@@ -23,7 +23,8 @@ moka = { version = "0.12", features = ["future"] }
 async-trait = "0.1.89"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+http-body-util = "0.1"
+bytes = "1.11.1"
 
 [dev-dependencies]
-http-body-util = "0.1"
 tower = "0.5"

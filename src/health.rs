@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{atomic::Ordering, Arc, RwLock},
     time::SystemTime,
 };
 
@@ -10,7 +10,10 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use metrics::gauge;
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::config::{Backend, HealthCheckConfig};
+use crate::{
+    config::{Backend, HealthCheckConfig},
+    state::RuntimeBackend,
+};
 
 #[derive(Debug, Clone)]
 pub struct BackendHealthStatus {
@@ -114,7 +117,7 @@ async fn perform_health_check(
 
 pub async fn health_check_loop(
     client: Client<HttpsConnector<HttpConnector>, Body>,
-    backends: Vec<Backend>,
+    backends: Vec<RuntimeBackend>,
     health_state: Arc<HealthState>,
     health_config: HealthCheckConfig,
 ) {
@@ -122,10 +125,12 @@ pub async fn health_check_loop(
 
     loop {
         for backend in &backends {
-            let check_result = perform_health_check(&client, backend, &health_config).await;
+            let check_result = perform_health_check(&client, &backend.config, &health_config).await;
 
-            // Get current status
-            let mut current_status = health_state.get_status(&backend.label).unwrap_or_default();
+            // Get current status from the detailed state
+            let mut current_status = health_state
+                .get_status(&backend.config.label)
+                .unwrap_or_default();
 
             let previous_healthy = current_status.healthy;
 
@@ -142,9 +147,9 @@ pub async fn health_check_loop(
                         current_status.healthy = true;
                     }
 
-                    tracing::info!(
+                    tracing::debug!(
                         "Health check succeeded for backend {} (consecutive successes: {})",
-                        backend.label,
+                        backend.config.label,
                         current_status.consecutive_successes
                     );
                 }
@@ -162,7 +167,7 @@ pub async fn health_check_loop(
 
                     tracing::warn!(
                         "Health check failed for backend {} (consecutive failures: {}): {}",
-                        backend.label,
+                        backend.config.label,
                         current_status.consecutive_failures,
                         error
                     );
@@ -175,23 +180,28 @@ pub async fn health_check_loop(
             if previous_healthy && !current_status.healthy {
                 tracing::warn!(
                     "Backend {} marked as UNHEALTHY after {} consecutive failures",
-                    backend.label,
+                    backend.config.label,
                     current_status.consecutive_failures
                 );
             } else if !previous_healthy && current_status.healthy {
                 tracing::info!(
                     "Backend {} marked as HEALTHY after {} consecutive successes",
-                    backend.label,
+                    backend.config.label,
                     current_status.consecutive_successes
                 );
             }
 
             // Update metrics
-            gauge!("rpc_backend_health", "backend" => backend.label.clone())
+            gauge!("rpc_backend_health", "backend" => backend.config.label.clone())
                 .set(if current_status.healthy { 1.0 } else { 0.0 });
 
-            // Update state
-            health_state.update_status(&backend.label, current_status);
+            // Update detailed state (locked)
+            health_state.update_status(&backend.config.label, current_status.clone());
+
+            // Update atomic boolean (lock-free)
+            backend
+                .healthy
+                .store(current_status.healthy, Ordering::Relaxed);
         }
 
         sleep(check_interval).await;

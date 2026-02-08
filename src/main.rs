@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::{atomic::AtomicBool, Arc}};
 
 use axum::{
     middleware,
@@ -14,7 +14,7 @@ use sol_rpc_router::{
     handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, track_metrics, ws_proxy},
     health::{health_check_loop, HealthState},
     keystore::RedisKeyStore,
-    state::AppState,
+    state::{AppState, RuntimeBackend},
 };
 use tracing::{error, info};
 
@@ -61,11 +61,14 @@ async fn main() {
         }
     }
 
-    // Build label-to-URL mapping
-    let label_to_url: HashMap<String, String> = config
+    // Initialize runtime backends with atomic health status
+    let runtime_backends: Vec<RuntimeBackend> = config
         .backends
         .iter()
-        .map(|b| (b.label.clone(), b.url.clone()))
+        .map(|b| RuntimeBackend {
+            config: b.clone(),
+            healthy: Arc::new(AtomicBool::new(true)), // Default to healthy
+        })
         .collect();
 
     // Initialize health state
@@ -86,18 +89,18 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client: client.clone(),
-        backends: config.backends.clone(),
+        backends: runtime_backends.clone(),
         keystore: Arc::new(keystore),
         method_routes: config.method_routes,
-        label_to_url,
         health_state: health_state.clone(),
         proxy_timeout_secs: config.proxy.timeout_secs,
     });
 
     // Spawn background health check task
     let health_check_client = client.clone();
-    let health_check_backends = config.backends.clone();
+    let health_check_backends = runtime_backends; // Move the runtime backends here
     let health_check_config = config.health_check.clone();
+    let health_check_state = health_state.clone();
 
     tokio::spawn(async move {
         info!(
@@ -109,7 +112,7 @@ async fn main() {
         health_check_loop(
             health_check_client,
             health_check_backends,
-            health_state,
+            health_check_state,
             health_check_config,
         )
         .await;
