@@ -30,6 +30,7 @@ src/
   mock.rs           MockKeyStore for testing (supports error injection via set_error())
   lib.rs            Module declarations
   bin/rpc-admin.rs  Admin CLI for API key CRUD operations
+  bin/benchmark.rs  In-process benchmark for performance validation
 
 tests/
   config_test.rs    Config validation paths
@@ -42,7 +43,7 @@ tests/
 
 - **State**: `AppState` is shared via `Arc<AppState>` and passed to handlers via Axum's `State` extractor.
 - **KeyStore trait**: `async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String>`. Returns `Ok(Some(info))` for valid, `Ok(None)` for invalid/inactive, `Err(msg)` for errors (including "Rate limit exceeded").
-- **Health**: `HealthState` uses `RwLock<HashMap<String, BackendHealthStatus>>`. Backends default to healthy. The health check loop runs in a background tokio task.
+- **Health**: `HealthState` uses `RwLock<HashMap<String, BackendHealthStatus>>` for aggregate status. Individual `BackendConfig` structs use `Arc<AtomicBool>` for lock-free health checks on the hot path. Backends default to healthy. The health check loop runs in a background tokio task.
 - **Backend selection**: Weighted random among healthy backends. Method routes override this if the target backend is healthy.
 - **WebSocket**: Separate server on port+1. Same auth flow, then `select_ws_backend()` picks a backend with `ws_url` configured.
 - **Tests**: Integration tests in `tests/` directory. Use `tower::ServiceExt::oneshot()` to test Axum routers without binding ports (except `start_mock_backend()` which binds to a random port for proxy tests).

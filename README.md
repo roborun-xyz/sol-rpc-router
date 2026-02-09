@@ -4,14 +4,14 @@ A high-performance reverse-proxy for Solana JSON-RPC and WebSocket endpoints wit
 
 ## Features
 
-- **API Key Authentication** -- query parameter `?api-key=` validated against Redis with local caching (moka, 60 s TTL).
-- **Rate Limiting** -- per-key RPS limits enforced atomically in Redis (INCR + EXPIRE Lua script).
-- **Weighted Load Balancing** -- distribute requests across backends by configurable weight; unhealthy backends are automatically excluded.
-- **Method-Based Routing** -- pin specific RPC methods (e.g. `getSlot`) to designated backends.
-- **WebSocket Proxying** -- separate WS server (HTTP port + 1) with the same auth, rate limiting, and weighted backend selection.
-- **Health Checks** -- background loop calls a configurable RPC method per backend; consecutive-failure / consecutive-success thresholds control status transitions.
-- **Prometheus Metrics** -- `GET /metrics` exposes request counts, latencies, and backend health gauges.
-- **Admin CLI** (`rpc-admin`) -- create, list, inspect, and revoke API keys in Redis.
+- **API Key Authentication**: query parameter `?api-key=` validated against Redis with local caching (moka, 60 s TTL).
+- **Rate Limiting**: per-key RPS limits enforced atomically in Redis (INCR + EXPIRE Lua script).
+- **Weighted Load Balancing**: distribute requests across backends by configurable weight; unhealthy backends are automatically excluded.
+- **Method-Based Routing**: pin specific RPC methods (e.g. `getSlot`) to designated backends.
+- **WebSocket Proxying**: separate WS server (HTTP port + 1) with the same auth, rate limiting, and weighted backend selection.
+- **Health Checks**: background loop calls a configurable RPC method per backend; consecutive-failure / consecutive-success thresholds control status transitions.
+- **Prometheus Metrics**: `GET /metrics` exposes request counts, latencies, and backend health gauges.
+- **Admin CLI** (`rpc-admin`): create, list, inspect, and revoke API keys in Redis.
 
 ## Prerequisites
 
@@ -74,10 +74,10 @@ getSlot = "mainnet-primary"
 - `proxy.timeout_secs` must be > 0.
 - `method_routes` values must reference existing backend labels.
 
-## Key Management CLI
+## API Key Management CLI
 
 ```bash
-# Create a key (auto-generated)
+# Create an API key (auto-generated)
 rpc-admin create <owner> --rate-limit 10
 
 # Create with a specific key value
@@ -105,26 +105,6 @@ Redis URL can be set via `--redis-url` flag or `REDIS_URL` env var (default `red
 | `/metrics` | GET | Prometheus metrics |
 | `ws://host:port+1/` | WS | WebSocket proxy (requires `?api-key=`) |
 
-## Architecture
-
-```
-src/
-  main.rs         -- entry point, server setup
-  config.rs       -- TOML config loading & validation
-  state.rs        -- AppState, select_backend(), select_ws_backend()
-  handlers.rs     -- proxy, ws_proxy, health_endpoint, middleware
-  health.rs       -- HealthState, health_check_loop
-  keystore.rs     -- KeyStore trait, RedisKeyStore
-  mock.rs         -- MockKeyStore for tests
-  bin/rpc-admin.rs -- admin CLI
-
-tests/
-  config_test.rs  -- config validation (10 tests)
-  handler_test.rs -- proxy, health, middleware (12 tests)
-  keystore_test.rs -- mock keystore (6 tests)
-  routing_test.rs -- backend selection (7 tests)
-```
-
 ## Testing
 
 ```bash
@@ -133,7 +113,3 @@ cargo test -- --list     # list test names
 ```
 
 All tests use mocks only -- no Redis or real HTTP backends required (except localhost mock servers started in-process).
-
-## License
-
-See repository for license details.
