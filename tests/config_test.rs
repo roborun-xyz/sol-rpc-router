@@ -3,10 +3,13 @@ use std::io::Write;
 use sol_rpc_router::config::load_config;
 
 fn write_temp_config(name: &str, content: &str) -> String {
-    let path = format!("/tmp/claude/test_config_{}.toml", name);
+    let mut path = std::env::temp_dir();
+    path.push(format!("sol_rpc_router_test_config_{}.toml", name));
+    let path_str = path.to_str().unwrap().to_string();
+
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(content.as_bytes()).unwrap();
-    path
+    path_str
 }
 
 #[test]
@@ -31,9 +34,13 @@ weight = 1
 
 #[test]
 fn test_load_config_file_not_found() {
-    let err = load_config("/tmp/claude/nonexistent_config.toml").unwrap_err();
+    let mut path = std::env::temp_dir();
+    path.push("sol_rpc_router_nonexistent_config.toml");
+    let path_str = path.to_str().unwrap();
+
+    let err = load_config(path_str).unwrap_err();
     assert!(
-        err.to_string().contains("not found"),
+        err.to_string().contains("not found") || err.to_string().contains("No such file"),
         "Expected 'not found' in error: {}",
         err
     );
