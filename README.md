@@ -18,7 +18,7 @@ A high-performance reverse-proxy for Solana JSON-RPC and WebSocket endpoints wit
 - Rust 2021 edition (stable)
 - Redis (for API key storage and rate limiting)
 
-## Quick Start
+## Quick Start (Local)
 
 ```bash
 # Build
@@ -29,6 +29,31 @@ cargo build --release
 
 # Create an API key
 ./target/release/rpc-admin create my-client --rate-limit 50
+```
+
+## Quick Start (Docker)
+
+Run the router and Redis stack with a single command:
+
+```bash
+# 1. Start the stack (uses config.docker.toml)
+docker compose up -d
+
+# 2. Generate an API key inside the container
+docker compose exec sol-rpc-router rpc-admin create my-client --rate-limit 100 --redis-url redis://redis:6379
+
+# 3. Test it
+curl "http://localhost:8080/?api-key=<YOUR_KEY>" -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}'
+```
+
+To customize the configuration, edit `config.docker.toml` and hot-reload without downtime:
+```bash
+docker compose kill -s SIGHUP sol-rpc-router
+```
+
+Or restart the container to pick up changes:
+```bash
+docker compose restart sol-rpc-router
 ```
 
 ## Configuration
