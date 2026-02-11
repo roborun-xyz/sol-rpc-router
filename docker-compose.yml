@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  sol-rpc-router:
+    build: .
+    volumes:
+      - ./config.docker.toml:/app/config.toml:ro
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "9090:9090" # metrics
+    environment:
+      - RUST_LOG=info
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

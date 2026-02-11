@@ -1,0 +1,16 @@
+target/
+**/*.rs.bk
+.git/
+.env
+.DS_Store
+*.swp
+*.log
+docker-compose.yml
+Dockerfile
+README.md
+LICENSE
+.github/
+memory/
+projects/
+tests/
+bench_config.toml
