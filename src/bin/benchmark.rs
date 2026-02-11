@@ -5,9 +5,10 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
+use arc_swap::ArcSwap;
 use axum::{
     extract::Json,
     middleware,
@@ -25,7 +26,7 @@ use sol_rpc_router::{
     handlers::{extract_rpc_method, health_endpoint, proxy, track_metrics},
     health::HealthState,
     mock::MockKeyStore,
-    state::{AppState, RuntimeBackend},
+    state::{AppState, RouterState, RuntimeBackend},
 };
 use tokio::sync::Barrier;
 
@@ -86,13 +87,18 @@ async fn start_router(upstream_addr: SocketAddr) -> SocketAddr {
 
     let health_state = Arc::new(HealthState::new(vec!["mock-upstream".to_string()]));
 
+    let router_state = RouterState {
+        backends: vec![runtime_backend],
+        method_routes: HashMap::new(),
+        health_state: health_state.clone(),
+        proxy_timeout_secs: 30,
+        health_check_config: sol_rpc_router::config::HealthCheckConfig::default(),
+    };
+
     let state = Arc::new(AppState {
         client,
-        backends: vec![runtime_backend],
         keystore,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 30,
+        state: Arc::new(ArcSwap::from_pointee(router_state)),
     });
 
     let app = Router::new()
@@ -130,7 +136,7 @@ async fn main() {
     println!("Router listening on {}", router_addr);
 
     // Give servers a moment to be fully ready
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // 3. Flood the router
     let target_url = format!("http://{}/?api-key=bench-key", router_addr);
@@ -138,7 +144,7 @@ async fn main() {
         Client::builder(TokioExecutor::new()).build_http();
 
     let start_time = Instant::now();
-    let duration = Duration::from_secs(args.duration);
+    let duration = std::time::Duration::from_secs(args.duration);
     let success_count = Arc::new(AtomicUsize::new(0));
     let error_count = Arc::new(AtomicUsize::new(0));
     let latencies = Arc::new(tokio::sync::Mutex::new(Vec::new()));

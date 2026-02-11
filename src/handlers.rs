@@ -229,8 +229,9 @@ pub async fn proxy(
     *req.uri_mut() = parsed_uri;
 
     // Forward request
+    let proxy_timeout = state.state.load().proxy_timeout_secs;
     let result = timeout(
-        Duration::from_secs(state.proxy_timeout_secs),
+        Duration::from_secs(proxy_timeout),
         state.client.request(req),
     )
     .await;
@@ -250,7 +251,7 @@ pub async fn proxy(
             StatusCode::GATEWAY_TIMEOUT,
             format!(
                 "Upstream request timed out after {}s",
-                state.proxy_timeout_secs
+                proxy_timeout
             ),
         )
             .into_response(),
@@ -274,12 +275,13 @@ pub struct BackendHealth {
 }
 
 pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let all_statuses = state.health_state.get_all_statuses();
+    let current_state = state.state.load();
+    let all_statuses = current_state.health_state.get_all_statuses();
 
     let mut backends = Vec::new();
     let mut any_healthy = false;
 
-    for backend in &state.backends {
+    for backend in &current_state.backends {
         let status = all_statuses
             .get(&backend.config.label)
             .cloned()

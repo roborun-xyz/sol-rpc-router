@@ -4,6 +4,7 @@ use std::{
     time::SystemTime,
 };
 
+use arc_swap::ArcSwap;
 use axum::{body::Body, http::Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -12,7 +13,7 @@ use tokio::time::{sleep, timeout, Duration};
 
 use crate::{
     config::{Backend, HealthCheckConfig},
-    state::RuntimeBackend,
+    state::RouterState,
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ impl Default for BackendHealthStatus {
     }
 }
 
+#[derive(Debug)]
 pub struct HealthState {
     statuses: RwLock<HashMap<String, BackendHealthStatus>>,
 }
@@ -58,6 +60,9 @@ impl HealthState {
     pub fn update_status(&self, label: &str, status: BackendHealthStatus) {
         if let Some(s) = self.statuses.write().unwrap().get_mut(label) {
             *s = status;
+        } else {
+             // If backend is new (hot reload), insert it
+             self.statuses.write().unwrap().insert(label.to_string(), status);
         }
     }
 
@@ -117,15 +122,20 @@ async fn perform_health_check(
 
 pub async fn health_check_loop(
     client: Client<HttpsConnector<HttpConnector>, Body>,
-    backends: Vec<RuntimeBackend>,
-    health_state: Arc<HealthState>,
-    health_config: HealthCheckConfig,
+    router_state: Arc<ArcSwap<RouterState>>,
 ) {
-    let check_interval = Duration::from_secs(health_config.interval_secs);
-
     loop {
-        for backend in &backends {
-            let check_result = perform_health_check(&client, &backend.config, &health_config).await;
+        // Load the current state for this iteration
+        // We load it once per loop iteration to ensure consistency during the check cycle
+        let current_state = router_state.load();
+        
+        let backends = &current_state.backends;
+        let health_config = &current_state.health_check_config;
+        let health_state = &current_state.health_state;
+        let check_interval = Duration::from_secs(health_config.interval_secs);
+
+        for backend in backends {
+            let check_result = perform_health_check(&client, &backend.config, health_config).await;
 
             // Get current status from the detailed state
             let mut current_status = health_state
@@ -203,6 +213,9 @@ pub async fn health_check_loop(
                 .healthy
                 .store(current_status.healthy, Ordering::Relaxed);
         }
+
+        // Release the guard before sleeping so we don't hold old state in memory if it gets swapped
+        drop(current_state);
 
         sleep(check_interval).await;
     }

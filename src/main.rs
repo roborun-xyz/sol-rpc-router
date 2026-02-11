@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, sync::{atomic::AtomicBool, Arc}};
 
+use arc_swap::ArcSwap;
 use axum::{
     middleware,
     routing::{get, post},
@@ -14,8 +15,9 @@ use sol_rpc_router::{
     handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, track_metrics, ws_proxy},
     health::{health_check_loop, HealthState},
     keystore::RedisKeyStore,
-    state::{AppState, RuntimeBackend},
+    state::{AppState, RouterState, RuntimeBackend},
 };
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
@@ -75,6 +77,16 @@ async fn main() {
     let backend_labels: Vec<String> = config.backends.iter().map(|b| b.label.clone()).collect();
     let health_state = Arc::new(HealthState::new(backend_labels));
 
+    let initial_router_state = RouterState {
+        backends: runtime_backends,
+        method_routes: config.method_routes,
+        health_state: health_state.clone(),
+        proxy_timeout_secs: config.proxy.timeout_secs,
+        health_check_config: config.health_check.clone(),
+    };
+
+    let router_state = Arc::new(ArcSwap::from_pointee(initial_router_state));
+
     let https = HttpsConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
 
@@ -89,33 +101,88 @@ async fn main() {
 
     let state = Arc::new(AppState {
         client: client.clone(),
-        backends: runtime_backends.clone(),
         keystore: Arc::new(keystore),
-        method_routes: config.method_routes,
-        health_state: health_state.clone(),
-        proxy_timeout_secs: config.proxy.timeout_secs,
+        state: router_state.clone(),
     });
 
     // Spawn background health check task
     let health_check_client = client.clone();
-    let health_check_backends = runtime_backends; // Move the runtime backends here
-    let health_check_config = config.health_check.clone();
-    let health_check_state = health_state.clone();
+    let health_check_state = router_state.clone();
 
     tokio::spawn(async move {
-        info!(
-            "Starting health check loop (interval: {}s, timeout: {}s, method: {})",
-            health_check_config.interval_secs,
-            health_check_config.timeout_secs,
-            health_check_config.method
-        );
+        info!("Starting health check loop");
+        // Loop will read config from state each iteration
         health_check_loop(
             health_check_client,
-            health_check_backends,
             health_check_state,
-            health_check_config,
         )
         .await;
+    });
+
+    // Spawn SIGHUP handler for hot reload
+    let reload_state = router_state.clone();
+    let config_path = args.config.clone();
+    // We keep the original health_state to preserve history across reloads if backends match
+    let persistent_health_state = health_state.clone(); 
+
+    tokio::spawn(async move {
+        let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
+        
+        loop {
+            sighup.recv().await;
+            info!("Received SIGHUP, reloading configuration from {}", config_path);
+
+            match load_config(&config_path) {
+                Ok(new_config) => {
+                    info!("Configuration reloaded successfully");
+                    info!("New backend count: {}", new_config.backends.len());
+                    
+                    // Re-initialize runtime backends
+                    // We attempt to preserve health status if backend label matches
+                    let new_runtime_backends: Vec<RuntimeBackend> = new_config
+                        .backends
+                        .iter()
+                        .map(|b| {
+                            // Check if we have existing status for this label
+                            let is_healthy = if let Some(status) = persistent_health_state.get_status(&b.label) {
+                                status.healthy
+                            } else {
+                                true // Default new backends to healthy
+                            };
+
+                            RuntimeBackend {
+                                config: b.clone(),
+                                healthy: Arc::new(AtomicBool::new(is_healthy)),
+                            }
+                        })
+                        .collect();
+                    
+                    // Update method routes info
+                    if !new_config.method_routes.is_empty() {
+                         info!("Updated method routing overrides:");
+                         for (method, label) in &new_config.method_routes {
+                             info!("  - {} -> {}", method, label);
+                         }
+                    }
+
+                    // Create new router state
+                    let new_router_state = RouterState {
+                        backends: new_runtime_backends,
+                        method_routes: new_config.method_routes,
+                        health_state: persistent_health_state.clone(), // Reuse the persistent health state container
+                        proxy_timeout_secs: new_config.proxy.timeout_secs,
+                        health_check_config: new_config.health_check,
+                    };
+
+                    // Atomically swap the state
+                    reload_state.store(Arc::new(new_router_state));
+                    info!("Router state atomically swapped");
+                }
+                Err(e) => {
+                    error!("Failed to reload configuration: {}", e);
+                }
+            }
+        }
     });
 
     // HTTP server (JSON-RPC over HTTP)

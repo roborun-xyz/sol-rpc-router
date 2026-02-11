@@ -1,0 +1,10 @@
+port = 8081
+redis_url = "redis://127.0.0.1:6379"
+
+[[backends]]
+label = "mock"
+url = "http://127.0.0.1:9090"
+weight = 1
+
+[proxy]
+timeout_secs = 5
