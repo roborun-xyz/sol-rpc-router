@@ -18,6 +18,7 @@ fn test_load_config_valid() {
         "valid",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = "redis://localhost"
 
 [[backends]]
@@ -28,6 +29,7 @@ weight = 1
     );
     let config = load_config(&path).unwrap();
     assert_eq!(config.port, 8080);
+    assert_eq!(config.metrics_port, 9091);
     assert_eq!(config.backends.len(), 1);
     assert_eq!(config.backends[0].label, "b1");
 }
@@ -60,6 +62,7 @@ fn test_load_config_empty_redis_url() {
         "empty_redis",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = ""
 
 [[backends]]
@@ -82,6 +85,7 @@ fn test_load_config_no_backends() {
         "no_backends",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = "redis://localhost"
 backends = []
 "#,
@@ -100,6 +104,7 @@ fn test_load_config_duplicate_labels() {
         "dup_labels",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = "redis://localhost"
 
 [[backends]]
@@ -127,6 +132,7 @@ fn test_load_config_zero_weight() {
         "zero_weight",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = "redis://localhost"
 
 [[backends]]
@@ -151,6 +157,7 @@ fn test_load_config_empty_label() {
         "empty_label",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = "redis://localhost"
 
 [[backends]]
@@ -173,6 +180,7 @@ fn test_load_config_zero_proxy_timeout() {
         "zero_timeout",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = "redis://localhost"
 
 [[backends]]
@@ -198,6 +206,7 @@ fn test_load_config_unknown_method_route() {
         "bad_method_route",
         r#"
 port = 8080
+metrics_port = 9091
 redis_url = "redis://localhost"
 
 [[backends]]
@@ -220,5 +229,70 @@ getSlot = "nonexistent"
         msg.contains("unknown backend label"),
         "Expected 'unknown backend label' in error: {}",
         msg
+    );
+}
+
+#[test]
+fn test_load_config_missing_metrics_port() {
+    let path = write_temp_config(
+        "missing_metrics",
+        r#"
+port = 8080
+# metrics_port missing
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(err.to_string().contains("missing field `metrics_port`"));
+}
+
+#[test]
+fn test_load_config_metrics_port_conflict_http() {
+    let path = write_temp_config(
+        "metrics_conflict_http",
+        r#"
+port = 8080
+metrics_port = 8080
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("HTTP port and Metrics port must be different"),
+        "Expected conflict error: {}",
+        err
+    );
+}
+
+#[test]
+fn test_load_config_metrics_port_conflict_ws() {
+    let path = write_temp_config(
+        "metrics_conflict_ws",
+        r#"
+port = 8080
+metrics_port = 8081
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("conflicts with WebSocket port"),
+        "Expected WS conflict error: {}",
+        err
     );
 }
