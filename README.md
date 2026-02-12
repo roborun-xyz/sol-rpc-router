@@ -91,6 +91,9 @@ rpc-admin inspect <api_key>
 
 # Revoke a key
 rpc-admin revoke <api_key>
+
+# Update a key
+rpc-admin update <api_key> --rate-limit 100 --active true
 ```
 
 Redis URL can be set via `--redis-url` flag or `REDIS_URL` env var (default `redis://127.0.0.1:6379`).
