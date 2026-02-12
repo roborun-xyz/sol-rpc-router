@@ -34,6 +34,20 @@ enum Commands {
     },
     /// Revoke an API key
     Revoke { key: String },
+    /// Update an existing API key
+    Update {
+        /// API key to update
+        key: String,
+        /// New rate limit (requests per second)
+        #[arg(long)]
+        rate_limit: Option<u64>,
+        /// New owner name
+        #[arg(long)]
+        owner: Option<String>,
+        /// Activate (true) or deactivate (false)
+        #[arg(long)]
+        active: Option<bool>,
+    },
     /// List all API keys
     List,
     /// Inspect an API key
@@ -100,6 +114,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Revoked key: {}", key);
             } else {
                 println!("Key not found: {}", key);
+            }
+        }
+        Commands::Update {
+            key,
+            rate_limit,
+            owner,
+            active,
+        } => {
+            let redis_key = format!("api_key:{}", key);
+            // Check existence first
+            let exists: bool = redis::cmd("EXISTS")
+                .arg(&redis_key)
+                .query_async(&mut con)
+                .await?;
+
+            if !exists {
+                println!("Key not found: {}", key);
+                return Ok(());
+            }
+
+            let mut pipe = redis::pipe();
+            let mut changes = Vec::new();
+
+            if let Some(rl) = rate_limit {
+                pipe.hset(&redis_key, "rate_limit", rl);
+                changes.push(format!("rate_limit -> {}", rl));
+            }
+
+            if let Some(o) = owner {
+                pipe.hset(&redis_key, "owner", &o);
+                changes.push(format!("owner -> {}", o));
+            }
+
+            if let Some(a) = active {
+                let status = if a { "true" } else { "false" };
+                pipe.hset(&redis_key, "active", status);
+                changes.push(format!("active -> {}", status));
+            }
+
+            if changes.is_empty() {
+                println!("No changes requested for key: {}", key);
+            } else {
+                let _: () = pipe.query_async(&mut con).await?;
+                println!("Updated key: {}", key);
+                for change in changes {
+                    println!("  {}", change);
+                }
             }
         }
         Commands::List => {
