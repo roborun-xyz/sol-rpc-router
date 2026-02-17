@@ -16,6 +16,12 @@ pub struct MockKeyStore {
     pub error_keys: Arc<Mutex<HashMap<String, String>>>,
 }
 
+impl Default for MockKeyStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockKeyStore {
     pub fn new() -> Self {
         Self {

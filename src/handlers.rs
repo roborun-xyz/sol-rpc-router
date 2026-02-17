@@ -122,7 +122,7 @@ pub async fn track_metrics(req: Request<Body>, next: Next) -> Response {
         .map(|b| b.0.clone())
         .unwrap_or_else(|| "none".to_string());
 
-    histogram!("rpc_request_duration_seconds").record(duration);
+    histogram!("rpc_request_duration_seconds", "rpc_method" => rpc_method.clone(), "backend" => backend.clone()).record(duration);
     counter!("rpc_requests_total", "method" => method, "status" => status, "rpc_method" => rpc_method, "backend" => backend).increment(1);
 
     response
@@ -146,12 +146,12 @@ pub async fn proxy(
             // Valid key
         }
         Ok(None) => {
-            info!("API key '{}' is invalid", api_key);
+            info!("Invalid API key presented (prefix={}...)", &api_key[..api_key.len().min(6)]);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
         Err(e) => {
             if e == "Rate limit exceeded" {
-                warn!("API key '{}' rate limited", api_key);
+                warn!("API key rate limited (prefix={}...)", &api_key[..api_key.len().min(6)]);
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
             } else {
                 error!("Key validation error: {}", e);
@@ -177,18 +177,23 @@ pub async fn proxy(
         }
     };
 
-    // Rebuild URI (remove ?api-key=... from request)
-    let request_path_and_query = req
+    // Rebuild URI: strip api-key from query params while preserving others
+    let path = req.uri().path();
+    let cleaned_query = req
         .uri()
-        .path_and_query()
-        .map(|x| x.as_str())
-        .unwrap_or("/");
+        .query()
+        .map(|q| {
+            q.split('&')
+                .filter(|p| !p.starts_with("api-key="))
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .unwrap_or_default();
 
-    // Remove api-key from the incoming request's query parameters
-    let cleaned_request_path = if let Some(pos) = request_path_and_query.find("?api-key=") {
-        &request_path_and_query[..pos]
+    let cleaned_request_path = if cleaned_query.is_empty() {
+        path.to_string()
     } else {
-        request_path_and_query
+        format!("{}?{}", path, cleaned_query)
     };
 
     // Build URI with selected backend
@@ -331,14 +336,14 @@ pub async fn ws_proxy(
             // Authorized
         }
         Ok(None) => {
-            info!("WebSocket: API key '{}' is invalid from {}", api_key, addr);
+            info!("WebSocket: Invalid API key from {} (prefix={}...)", addr, &api_key[..api_key.len().min(6)]);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
         Err(e) => {
             if e == "Rate limit exceeded" {
                 warn!(
-                    "WebSocket: API key '{}' rate limited from {}",
-                    api_key, addr
+                    "WebSocket: API key rate limited from {} (prefix={}...)",
+                    addr, &api_key[..api_key.len().min(6)]
                 );
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
             }
@@ -479,8 +484,14 @@ async fn handle_ws_connection(
 
     // Run both directions concurrently, stop when either ends
     tokio::select! {
-        _ = client_to_backend => {},
-        _ = backend_to_client => {},
+        _ = client_to_backend => {
+            // Client side ended; send close to backend
+            let _ = backend_write.send(TungsteniteMessage::Close(None)).await;
+        },
+        _ = backend_to_client => {
+            // Backend side ended; send close to client
+            let _ = client_write.send(Message::Close(None)).await;
+        },
     }
 
     info!(

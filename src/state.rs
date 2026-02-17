@@ -11,7 +11,7 @@ use axum::body::Body;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use rand::Rng;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     config::{Backend, HealthCheckConfig},
@@ -55,11 +55,11 @@ impl AppState {
                     .find(|b| b.config.label == *backend_label)
                 {
                     if backend.healthy.load(Ordering::Relaxed) {
-                        info!("Method {} routed to label={}", method, backend_label);
+                        debug!("Method {} routed to label={}", method, backend_label);
                         return Some((backend.config.label.clone(), backend.config.url.clone()));
                     } else {
                         info!(
-                            "Method {} routed to label={} but backend is unhealthy, falling back to weighted selection",
+                            "Method {} target label={} is unhealthy, falling back to weighted selection",
                             method, backend_label
                         );
                     }

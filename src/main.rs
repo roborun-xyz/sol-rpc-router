@@ -46,7 +46,7 @@ async fn main() {
     let config = load_config(&args.config).expect("Failed to load router configuration");
 
     info!("Loaded configuration from: {}", args.config);
-    info!("Redis URL configured: {}", config.redis_url);
+    info!("Redis URL configured (host redacted)");
 
     info!("Loaded {} backends", config.backends.len());
     for backend in &config.backends {
