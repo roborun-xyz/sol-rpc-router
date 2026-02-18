@@ -1,0 +1,21 @@
+port = 8080
+redis_url = "redis://redis:6379"
+
+[[backends]]
+label = "mainnet-primary"
+url = "https://api.mainnet-beta.solana.com"
+weight = 10
+# ws_url = "wss://api.mainnet-beta.solana.com"
+
+[proxy]
+timeout_secs = 30
+
+[health_check]
+interval_secs = 30
+timeout_secs = 5
+method = "getSlot"
+consecutive_failures_threshold = 3
+consecutive_successes_threshold = 2
+
+[method_routes]
+getSlot = "mainnet-primary"
