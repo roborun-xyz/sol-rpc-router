@@ -28,6 +28,9 @@ pub struct RpcMethod(pub String);
 #[derive(Clone)]
 pub struct SelectedBackend(pub String);
 
+#[derive(Clone)]
+pub struct ClientOwner(pub String);
+
 #[derive(Deserialize)]
 struct MethodProbe<'a> {
     method: Option<&'a str>,
@@ -122,8 +125,14 @@ pub async fn track_metrics(req: Request<Body>, next: Next) -> Response {
         .map(|b| b.0.clone())
         .unwrap_or_else(|| "none".to_string());
 
-    histogram!("rpc_request_duration_seconds", "rpc_method" => rpc_method.clone(), "backend" => backend.clone()).record(duration);
-    counter!("rpc_requests_total", "method" => method, "status" => status, "rpc_method" => rpc_method, "backend" => backend).increment(1);
+    let owner = response
+        .extensions()
+        .get::<ClientOwner>()
+        .map(|o| o.0.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    histogram!("rpc_request_duration_seconds", "rpc_method" => rpc_method.clone(), "backend" => backend.clone(), "owner" => owner.clone()).record(duration);
+    counter!("rpc_requests_total", "method" => method, "status" => status, "rpc_method" => rpc_method, "backend" => backend, "owner" => owner).increment(1);
 
     response
 }
@@ -141,9 +150,9 @@ pub async fn proxy(
         }
     };
 
-    match state.keystore.validate_key(&api_key).await {
-        Ok(Some(_info)) => {
-            // Valid key
+    let owner = match state.keystore.validate_key(&api_key).await {
+        Ok(Some(info)) => {
+            info.owner
         }
         Ok(None) => {
             info!("Invalid API key presented (prefix={}...)", &api_key[..api_key.len().min(6)]);
@@ -159,7 +168,10 @@ pub async fn proxy(
                     .into_response();
             }
         }
-    }
+    };
+
+    // Store owner in request extensions for metrics middleware
+    req.extensions_mut().insert(ClientOwner(owner));
 
     // Get RPC method from extension (set by extract_rpc_method middleware)
     let rpc_method = req.extensions().get::<RpcMethod>().map(|m| m.0.as_str());
@@ -233,6 +245,9 @@ pub async fn proxy(
 
     *req.uri_mut() = parsed_uri;
 
+    // Capture owner before request is consumed
+    let client_owner = req.extensions().get::<ClientOwner>().cloned();
+
     // Forward request
     let proxy_timeout = state.state.load().proxy_timeout_secs;
     let result = timeout(
@@ -243,9 +258,12 @@ pub async fn proxy(
 
     match result {
         Ok(Ok(mut resp)) => {
-            // Store selected backend label in response extensions for logging
+            // Store selected backend label and owner in response extensions for logging/metrics
             resp.extensions_mut()
                 .insert(SelectedBackend(backend_label.to_string()));
+            if let Some(owner) = client_owner {
+                resp.extensions_mut().insert(owner);
+            }
             resp.into_response()
         }
         Ok(Err(err)) => {
@@ -331,9 +349,9 @@ pub async fn ws_proxy(
     };
 
     // Validate API key
-    match state.keystore.validate_key(&api_key).await {
-        Ok(Some(_)) => {
-            // Authorized
+    let owner = match state.keystore.validate_key(&api_key).await {
+        Ok(Some(info)) => {
+            info.owner
         }
         Ok(None) => {
             info!("WebSocket: Invalid API key from {} (prefix={}...)", addr, &api_key[..api_key.len().min(6)]);
@@ -350,7 +368,7 @@ pub async fn ws_proxy(
             error!("WebSocket: Key validation error: {}", e);
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
         }
-    }
+    };
 
     // Select a backend with WebSocket support
     let (backend_label, backend_ws_url) = match state.select_ws_backend() {
@@ -369,8 +387,8 @@ pub async fn ws_proxy(
     let backend_ws_url = backend_ws_url.to_string();
 
     info!(
-        "WebSocket: {} upgrading connection, backend={}",
-        addr, backend_label
+        "WebSocket: {} upgrading connection, backend={}, owner={}",
+        addr, backend_label, owner
     );
 
     ws.on_upgrade(move |client_socket| {
