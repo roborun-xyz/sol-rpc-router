@@ -18,6 +18,7 @@ use sol_rpc_router::{
     state::{AppState, RouterState, RuntimeBackend},
 };
 use tokio::signal::unix::{signal, SignalKind};
+use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
@@ -193,13 +194,15 @@ async fn main() {
         .with_state(state.clone())
         .layer(middleware::from_fn(track_metrics))
         .layer(middleware::from_fn(log_requests))
-        .layer(middleware::from_fn(extract_rpc_method));
+        .layer(middleware::from_fn(extract_rpc_method))
+        .layer(CorsLayer::permissive());
 
     // WebSocket server (following Solana convention: WS port = HTTP port + 1)
     let ws_app = Router::new()
         .route("/", get(ws_proxy))
         .with_state(state)
-        .layer(middleware::from_fn(log_requests));
+        .layer(middleware::from_fn(log_requests))
+        .layer(CorsLayer::permissive());
 
     // Metrics server (dedicated port)
     let metrics_app = Router::new()

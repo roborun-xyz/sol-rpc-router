@@ -26,6 +26,7 @@ metrics-exporter-prometheus = "0.16"
 http-body-util = "0.1"
 bytes = "1.11.1"
 arc-swap = "1.8.1"
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 tower = "0.5"
