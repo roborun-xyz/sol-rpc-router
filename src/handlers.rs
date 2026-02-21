@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use futures_util::{SinkExt, StreamExt};
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use serde::{Deserialize, Serialize};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
@@ -356,6 +356,7 @@ pub async fn ws_proxy(
         Some(k) => k,
         None => {
             info!("WebSocket: No API key provided from {}", addr);
+            counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => "auth_failed").increment(1);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     };
@@ -367,6 +368,7 @@ pub async fn ws_proxy(
         }
         Ok(None) => {
             info!("WebSocket: Invalid API key from {} (prefix={}...)", addr, &api_key[..api_key.len().min(6)]);
+            counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => "auth_failed").increment(1);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
         Err(e) => {
@@ -375,9 +377,11 @@ pub async fn ws_proxy(
                     "WebSocket: API key rate limited from {} (prefix={}...)",
                     addr, &api_key[..api_key.len().min(6)]
                 );
+                counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => "rate_limited").increment(1);
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
             }
             error!("WebSocket: Key validation error: {}", e);
+            counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => "error").increment(1);
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response();
         }
     };
@@ -387,6 +391,7 @@ pub async fn ws_proxy(
         Some(selection) => selection,
         None => {
             error!("No healthy WebSocket backends available");
+            counter!("ws_connections_total", "backend" => "none", "owner" => owner.clone(), "status" => "no_backend").increment(1);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No healthy WebSocket backends available",
@@ -404,7 +409,7 @@ pub async fn ws_proxy(
     );
 
     ws.on_upgrade(move |client_socket| {
-        handle_ws_connection(client_socket, backend_ws_url, backend_label, addr)
+        handle_ws_connection(client_socket, backend_ws_url, backend_label, owner, addr)
     })
     .into_response()
 }
@@ -413,6 +418,7 @@ async fn handle_ws_connection(
     client_socket: WebSocket,
     backend_url: String,
     backend_label: String,
+    owner: String,
     client_addr: SocketAddr,
 ) {
     // Connect to the backend WebSocket
@@ -423,9 +429,14 @@ async fn handle_ws_connection(
                 "WebSocket: Failed to connect to backend {} ({}): {}",
                 backend_label, backend_url, e
             );
+            counter!("ws_connections_total", "backend" => backend_label, "owner" => owner, "status" => "backend_connect_failed").increment(1);
             return;
         }
     };
+
+    counter!("ws_connections_total", "backend" => backend_label.clone(), "owner" => owner.clone(), "status" => "connected").increment(1);
+    gauge!("ws_active_connections", "backend" => backend_label.clone(), "owner" => owner.clone()).increment(1.0);
+    let connect_time = std::time::Instant::now();
 
     info!(
         "WebSocket: {} connected to backend {}",
@@ -436,11 +447,18 @@ async fn handle_ws_connection(
     let (mut client_write, mut client_read) = client_socket.split();
     let (mut backend_write, mut backend_read) = backend_socket.split();
 
+    // Clones for use inside async blocks
+    let bl1 = backend_label.clone();
+    let ow1 = owner.clone();
+    let bl2 = backend_label.clone();
+    let ow2 = owner.clone();
+
     // Forward client -> backend
     let client_to_backend = async {
         while let Some(msg) = client_read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
+                    counter!("ws_messages_total", "backend" => bl1.clone(), "owner" => ow1.clone(), "direction" => "client_to_backend").increment(1);
                     if backend_write
                         .send(TungsteniteMessage::Text(text))
                         .await
@@ -450,6 +468,7 @@ async fn handle_ws_connection(
                     }
                 }
                 Ok(Message::Binary(data)) => {
+                    counter!("ws_messages_total", "backend" => bl1.clone(), "owner" => ow1.clone(), "direction" => "client_to_backend").increment(1);
                     if backend_write
                         .send(TungsteniteMessage::Binary(data))
                         .await
@@ -486,11 +505,13 @@ async fn handle_ws_connection(
         while let Some(msg) = backend_read.next().await {
             match msg {
                 Ok(TungsteniteMessage::Text(text)) => {
+                    counter!("ws_messages_total", "backend" => bl2.clone(), "owner" => ow2.clone(), "direction" => "backend_to_client").increment(1);
                     if client_write.send(Message::Text(text)).await.is_err() {
                         break;
                     }
                 }
                 Ok(TungsteniteMessage::Binary(data)) => {
+                    counter!("ws_messages_total", "backend" => bl2.clone(), "owner" => ow2.clone(), "direction" => "backend_to_client").increment(1);
                     if client_write.send(Message::Binary(data)).await.is_err() {
                         break;
                     }
@@ -524,8 +545,12 @@ async fn handle_ws_connection(
         },
     }
 
+    let duration = connect_time.elapsed().as_secs_f64();
+    gauge!("ws_active_connections", "backend" => backend_label.clone(), "owner" => owner.clone()).decrement(1.0);
+    histogram!("ws_connection_duration_seconds", "backend" => backend_label.clone(), "owner" => owner.clone()).record(duration);
+
     info!(
-        "WebSocket: {} disconnected from backend {}",
-        client_addr, backend_label
+        "WebSocket: {} disconnected from backend {} (duration={:.1}s)",
+        client_addr, backend_label, duration
     );
 }
