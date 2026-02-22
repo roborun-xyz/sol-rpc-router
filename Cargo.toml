@@ -2,6 +2,12 @@
 name = "sol-rpc-router"
 version = "0.1.0"
 edition = "2021"
+description = "Solana JSON-RPC reverse proxy with API key auth, rate limiting, weighted load balancing, method-based routing, WebSocket proxying, health checking, and Prometheus metrics"
+license = "Apache-2.0"
+repository = "https://github.com/roborun-xyz/sol-rpc-router"
+keywords = ["solana", "rpc", "proxy", "load-balancer", "json-rpc"]
+categories = ["network-programming", "web-programming::http-server"]
+readme = "README.md"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "ws"] }
