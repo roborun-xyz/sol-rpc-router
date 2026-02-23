@@ -8,7 +8,7 @@ A high-performance reverse-proxy for Solana JSON-RPC and WebSocket endpoints wit
 - **Rate Limiting**: per-key RPS limits enforced atomically in Redis (INCR + EXPIRE Lua script).
 - **Weighted Load Balancing**: distribute requests across backends by configurable weight; unhealthy backends are automatically excluded.
 - **Method-Based Routing**: pin specific RPC methods (e.g. `getSlot`) to designated backends.
-- **WebSocket Proxying**: separate WS server (HTTP port + 1) with the same auth, rate limiting, and weighted backend selection.
+- **WebSocket Proxying**: upgrade on the main HTTP port or a dedicated WS port (HTTP port + 1), with the same auth, rate limiting, and weighted backend selection.
 - **Health Checks**: background loop calls a configurable RPC method per backend; consecutive-failure / consecutive-success thresholds control status transitions.
 - **Prometheus Metrics**: `GET /metrics` exposes request counts, latencies, and backend health gauges.
 - **Admin CLI** (`rpc-admin`): create, list, inspect, and revoke API keys in Redis.
@@ -74,6 +74,62 @@ getSlot = "mainnet-primary"
 - `proxy.timeout_secs` must be > 0.
 - `method_routes` values must reference existing backend labels.
 
+## WebSocket Handling
+
+The proxy supports Solana WebSocket subscriptions (e.g. `accountSubscribe`, `logsSubscribe`) with the same authentication and load-balancing guarantees as HTTP.
+
+### Connection Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router
+    participant Redis
+    participant Backend
+
+    Client->>Router: GET / (Upgrade: websocket) + API Key
+    Router->>Redis: Validate Key
+    Redis-->>Router: OK (Owner info)
+    Router->>Router: Select Healthy Backend
+    Router->>Backend: Connect (WS Handshake)
+    Backend-->>Router: 101 Switching Protocols
+    Router-->>Client: 101 Switching Protocols
+
+    Note over Client,Backend: Bi-directional Message Pipe
+
+    Client->>Router: Message
+    Router->>Backend: Forward
+    Backend->>Router: Message
+    Router->>Client: Forward
+```
+
+1. **Upgrade** — Clients open a WebSocket to the main HTTP port (`GET /` with `Upgrade: websocket`) or the dedicated WS port (HTTP port + 1). Both accept `?api-key=` as a query parameter.
+2. **Authentication** — The API key is validated against Redis (same flow as HTTP: lookup, cache check, rate-limit enforcement). Failures return `401 Unauthorized` or `429 Too Many Requests` before the upgrade completes.
+3. **Backend Selection** — `select_ws_backend()` picks a healthy backend that has a `ws_url` configured, using the same weighted-random algorithm as HTTP requests.
+4. **Bi-directional Piping** — After the upgrade, the proxy opens a second WebSocket to the chosen backend (via `tokio-tungstenite`). Two concurrent tasks forward frames in each direction (client ↔ backend). Text, Binary, Ping, and Pong frames are relayed transparently. When either side sends a Close frame or errors out, `tokio::select!` shuts down the other direction.
+5. **Cleanup** — On disconnect the active-connection gauge is decremented and the total session duration is recorded.
+
+### Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ws_connections_total` | Counter | `backend`, `owner`, `status` | Connection attempts (`connected`, `auth_failed`, `rate_limited`, `no_backend`, `backend_connect_failed`, `error`) |
+| `ws_active_connections` | Gauge | `backend`, `owner` | Currently open WebSocket sessions |
+| `ws_messages_total` | Counter | `backend`, `owner`, `direction` | Frames relayed (`client_to_backend` / `backend_to_client`) |
+| `ws_connection_duration_seconds` | Histogram | `backend`, `owner` | Session duration from upgrade to close |
+
+### Configuration
+
+Backends that should accept WebSocket traffic must include a `ws_url` field. Backends without `ws_url` are excluded from WebSocket routing but still serve HTTP requests.
+
+```toml
+[[backends]]
+label  = "mainnet-primary"
+url    = "https://api.mainnet-beta.solana.com"
+ws_url = "wss://api.mainnet-beta.solana.com"   # enables WS for this backend
+weight = 10
+```
+
 ## API Key Management CLI
 
 ```bash
@@ -103,10 +159,11 @@ Redis URL can be set via `--redis-url` flag or `REDIS_URL` env var (default `red
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | POST | Proxy JSON-RPC requests (requires `?api-key=`) |
+| `/` | GET (Upgrade) | WebSocket proxy on main port (requires `?api-key=`) |
 | `/*path` | POST | Proxy with subpath |
 | `/health` | GET | Backend health status (JSON) |
 | `/metrics` | GET | Prometheus metrics |
-| `ws://host:port+1/` | WS | WebSocket proxy (requires `?api-key=`) |
+| `ws://host:port+1/` | WS | Dedicated WebSocket port (requires `?api-key=`) |
 
 ## Testing
 
