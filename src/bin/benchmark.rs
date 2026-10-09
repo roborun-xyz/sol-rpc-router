@@ -8,12 +8,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use axum::{
-    extract::Json,
-    middleware,
-    routing::{get, post},
-    Router,
-};
+use axum::{extract::Json, routing::post, Router};
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::Full;
@@ -22,9 +17,9 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use serde_json::{json, Value};
 use sol_rpc_router::{
     config::Backend,
-    handlers::{extract_rpc_method, health_endpoint, proxy, track_metrics},
     health::HealthState,
     mock::MockKeyStore,
+    router::http_router,
     state::{AppState, RouterState, RuntimeBackend},
 };
 use tokio::sync::Barrier;
@@ -88,18 +83,13 @@ async fn start_router(upstream_addr: SocketAddr) -> SocketAddr {
 
     let router_state = RouterState::simple(vec![runtime_backend], health_state.clone());
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(router_state)),
-    });
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    ));
 
-    let app = Router::new()
-        .route("/", post(proxy))
-        .route("/health", get(health_endpoint))
-        .with_state(state)
-        .layer(middleware::from_fn(track_metrics))
-        .layer(middleware::from_fn(extract_rpc_method));
+    let app = http_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

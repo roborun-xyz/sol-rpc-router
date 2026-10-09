@@ -12,6 +12,12 @@ use redis::{aio::ConnectionManager, Client, Script};
 /// changes take up to this long to propagate to a running router.
 pub const KEY_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Upper bound on cached key lookups (hits and misses). Bounds memory when a
+/// client sprays random keys.
+pub const KEY_CACHE_CAPACITY: u64 = 10_000;
+/// Keys longer than this are rejected before any Redis round trip.
+pub const MAX_KEY_LEN: usize = 128;
+
 /// Redis hash prefix for API key metadata.
 pub const KEY_PREFIX: &str = "api_key:";
 /// Redis key prefix for the per-second rate limit counters.
@@ -60,7 +66,10 @@ impl RedisKeyStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        let cache = Cache::builder().time_to_live(KEY_CACHE_TTL).build();
+        let cache = Cache::builder()
+            .time_to_live(KEY_CACHE_TTL)
+            .max_capacity(KEY_CACHE_CAPACITY)
+            .build();
 
         Ok(Self { conn, cache })
     }
@@ -136,6 +145,9 @@ pub fn parse_key_fields(fields: &HashMap<String, String>, now: u64) -> Option<Ke
 #[async_trait]
 impl KeyStore for RedisKeyStore {
     async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String> {
+        if key.is_empty() || key.len() > MAX_KEY_LEN {
+            return Ok(None);
+        }
         let info = match self.get_key_info(key).await? {
             Some(info) => info,
             None => return Ok(None),

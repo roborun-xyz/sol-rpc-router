@@ -44,11 +44,11 @@ fn create_test_state() -> AppState {
 
     let router_state = RouterState::simple(backends, health_state);
 
-    AppState {
+    AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(router_state)),
-    }
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    )
 }
 
 #[test]
@@ -85,11 +85,11 @@ fn test_select_backend_weighted() {
 
     let router_state = RouterState::simple(backends, health_state);
 
-    let state = AppState {
+    let state = AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(router_state)),
-    };
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    );
 
     let iterations = 1000;
     let mut primary_count = 0;
@@ -149,11 +149,11 @@ fn test_select_backend_method_override() {
         ..RouterState::simple(backends, health_state)
     };
 
-    let state = AppState {
+    let state = AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(router_state)),
-    };
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    );
 
     let (label, _) = state.select_backend(Some("eth_call")).unwrap();
     assert_eq!(label, "secondary");
@@ -228,11 +228,11 @@ fn create_ws_test_state() -> AppState {
 
     let router_state = RouterState::simple(backends, health_state);
 
-    AppState {
+    AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(router_state)),
-    }
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    )
 }
 
 #[test]

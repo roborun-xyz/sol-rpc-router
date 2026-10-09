@@ -32,14 +32,14 @@ pub const API_KEY_PARAM: &str = "api-key";
 pub fn build_uri(backend_url: &str, path: &str, query: Option<&str>) -> Result<Uri, String> {
     let base: Uri = backend_url
         .parse()
-        .map_err(|e| format!("invalid backend url '{}': {}", backend_url, e))?;
+        .map_err(|e| format!("invalid backend url '{}': {}", redact_url(backend_url), e))?;
 
     let scheme = base
         .scheme_str()
-        .ok_or_else(|| format!("backend url '{}' has no scheme", backend_url))?;
+        .ok_or_else(|| format!("backend url '{}' has no scheme", redact_url(backend_url)))?;
     let authority = base
         .authority()
-        .ok_or_else(|| format!("backend url '{}' has no host", backend_url))?;
+        .ok_or_else(|| format!("backend url '{}' has no host", redact_url(backend_url)))?;
 
     let base_path = base.path();
     let sub_path = path.trim_start_matches('/');
@@ -74,6 +74,15 @@ pub fn build_uri(backend_url: &str, path: &str, query: Option<&str>) -> Result<U
         .path_and_query(path_and_query)
         .build()
         .map_err(|e| format!("failed to build upstream uri: {}", e))
+}
+
+/// Renders a backend URL for logs and errors with its query string hidden,
+/// since provider URLs commonly carry credentials (`?api-key=...`).
+pub fn redact_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{}?<redacted>", base),
+        None => url.to_string(),
+    }
 }
 
 /// Removes the `api-key` parameter from a query string, keeping everything else.
@@ -246,6 +255,25 @@ mod tests {
         assert!(h.get(header::CONNECTION).is_none());
         assert_eq!(h.get(header::CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(h.get("x-rpc-backend").unwrap(), "helius");
+    }
+
+    #[test]
+    fn redact_url_hides_query_only() {
+        assert_eq!(
+            redact_url("https://rpc.example.com/?api-key=SECRET"),
+            "https://rpc.example.com/?<redacted>"
+        );
+        assert_eq!(
+            redact_url("https://rpc.example.com/v1"),
+            "https://rpc.example.com/v1"
+        );
+        assert_eq!(redact_url("wss://x/?a=1&b=2"), "wss://x/?<redacted>");
+    }
+
+    #[test]
+    fn build_uri_errors_do_not_leak_query() {
+        let err = build_uri("/relative?api-key=SECRET", "/", None).unwrap_err();
+        assert!(!err.contains("SECRET"), "{}", err);
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub struct ProxyConfig {
     /// Seconds to wait for in-flight requests after SIGTERM/SIGINT before
     /// exiting anyway.
     pub shutdown_grace_secs: u64,
+    /// Maximum concurrent WebSocket sessions per API key. `0` disables the cap.
+    pub max_ws_connections_per_key: u32,
 }
 
 impl Default for ProxyConfig {
@@ -52,6 +54,7 @@ impl Default for ProxyConfig {
             fanout_methods: Vec::new(),
             blocked_methods: Vec::new(),
             shutdown_grace_secs: 10,
+            max_ws_connections_per_key: 100,
         }
     }
 }
@@ -132,7 +135,11 @@ pub fn validate_config(
 
     for backend in &config.backends {
         if backend.label.is_empty() {
-            return Err(format!("Backend with URL '{}' has empty label", backend.url).into());
+            return Err(format!(
+                "Backend with URL '{}' has empty label",
+                crate::upstream::redact_url(&backend.url)
+            )
+            .into());
         }
         if backend.weight == 0 {
             return Err(format!("Backend '{}' has invalid weight 0", backend.label).into());

@@ -30,6 +30,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessag
 use tracing::{error, info, warn};
 
 use crate::{
+    keystore::MAX_KEY_LEN,
     rpc::{self, codes, RpcRequestInfo},
     state::{AppState, HttpClient, Selection},
     upstream,
@@ -40,6 +41,8 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 /// replies are tiny, so this is generous.
 const MAX_FANOUT_RESPONSE_SIZE: usize = 1024 * 1024;
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Slow-body clients are cut off after this long.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const BACKEND_HEADER: &str = "x-rpc-backend";
@@ -109,13 +112,21 @@ fn new_request_id() -> String {
 /// body back so the handler can forward it.
 pub async fn extract_rpc_method(req: Request<Body>, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
-    let body_bytes = match to_bytes(body, MAX_BODY_SIZE).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
+    let body_bytes = match timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_BODY_SIZE)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
             return rpc::error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 codes::INVALID_REQUEST,
                 "Request body too large",
+                None,
+            );
+        }
+        Err(_) => {
+            return rpc::error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                codes::INVALID_REQUEST,
+                "Timed out reading request body",
                 None,
             );
         }
@@ -131,10 +142,13 @@ pub async fn extract_rpc_method(req: Request<Body>, next: Next) -> Response {
 }
 
 pub async fn log_requests(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    addr: Option<ConnectInfo<SocketAddr>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    let addr = addr
+        .map(|ConnectInfo(a)| a.to_string())
+        .unwrap_or_else(|| "-".to_string());
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let rpc_method = req
@@ -276,6 +290,12 @@ pub async fn authenticate(
 ) -> Result<String, AuthFailure> {
     let api_key = extract_api_key(headers, params).ok_or(AuthFailure::Missing)?;
 
+    // Cheap rejection before any keystore round trip.
+    if api_key.len() > MAX_KEY_LEN {
+        info!("Rejected API key longer than {} bytes", MAX_KEY_LEN);
+        return Err(AuthFailure::Invalid);
+    }
+
     match state.keystore.validate_key(&api_key).await {
         Ok(Some(info)) => Ok(info.owner),
         Ok(None) => {
@@ -335,6 +355,40 @@ impl AuthFailure {
     }
 }
 
+/// Middleware: authenticates the request and stores the owner in request
+/// extensions. Runs before any body is read, so bad or rate-limited keys cost
+/// nothing beyond the key lookup.
+pub async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<Params>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let is_ws = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    match authenticate(&state, req.headers(), &params).await {
+        Ok(owner) => {
+            req.extensions_mut().insert(ClientOwner(owner.clone()));
+            let mut resp = next.run(req).await;
+            if resp.extensions().get::<ClientOwner>().is_none() {
+                resp.extensions_mut().insert(ClientOwner(owner));
+            }
+            resp
+        }
+        Err(failure) => {
+            if is_ws {
+                counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => failure.metric_status()).increment(1);
+            }
+            failure.into_response(None)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HTTP proxy
 // ---------------------------------------------------------------------------
@@ -370,19 +424,17 @@ fn tag_response(mut resp: Response, backend: &str, owner: &str, attempts: u32) -
     resp
 }
 
-pub async fn proxy(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<Params>,
-    req: Request<Body>,
-) -> Response {
+pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
     let (parts, body) = req.into_parts();
     let rpc_info = parts.extensions.get::<RpcRequestInfo>().cloned();
     let rpc_id = rpc_info.as_ref().map(|i| &i.id);
     let rpc_method = rpc_info.as_ref().map(|i| i.method.as_str());
 
-    let owner = match authenticate(&state, &parts.headers, &params).await {
-        Ok(owner) => owner,
-        Err(failure) => return failure.into_response(rpc_id),
+    // Set by `require_api_key`; absent only if the router was assembled
+    // without it, which we treat as a configuration error, not open access.
+    let owner = match parts.extensions.get::<ClientOwner>() {
+        Some(o) => o.0.clone(),
+        None => return AuthFailure::Missing.into_response(rpc_id),
     };
 
     let rs = state.state.load();
@@ -786,16 +838,35 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
 pub async fn ws_proxy(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    Query(params): Query<Params>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    req: Request<Body>,
 ) -> Response {
-    let owner = match authenticate(&state, &headers, &params).await {
-        Ok(owner) => owner,
-        Err(failure) => {
-            info!("WebSocket: auth failed from {}", addr);
-            counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => failure.metric_status()).increment(1);
-            return failure.into_response(None);
+    let owner = match req.extensions().get::<ClientOwner>() {
+        Some(o) => o.0.clone(),
+        None => {
+            counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => "auth_failed").increment(1);
+            return AuthFailure::Missing.into_response(None);
+        }
+    };
+
+    let limit = state.state.load().proxy.max_ws_connections_per_key;
+    let session = match state.try_open_ws_session(&owner, limit) {
+        Some(guard) => guard,
+        None => {
+            warn!(
+                "WebSocket: owner={} hit the per-key connection cap ({})",
+                owner, limit
+            );
+            counter!("ws_connections_total", "backend" => "none", "owner" => owner.clone(), "status" => "connection_limit").increment(1);
+            return rpc::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                codes::RATE_LIMITED,
+                format!(
+                    "Too many open WebSocket connections for this key (limit {})",
+                    limit
+                ),
+                None,
+            );
         }
     };
 
@@ -818,8 +889,10 @@ pub async fn ws_proxy(
         addr, backend_label, owner
     );
 
-    ws.on_upgrade(move |client_socket| {
-        handle_ws_connection(client_socket, backend_ws_url, backend_label, owner, addr)
+    ws.on_upgrade(move |client_socket| async move {
+        // Keep the slot until the session ends.
+        let _session = session;
+        handle_ws_connection(client_socket, backend_ws_url, backend_label, owner, addr).await
     })
 }
 

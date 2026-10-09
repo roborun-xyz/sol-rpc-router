@@ -4,15 +4,14 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use arc_swap::ArcSwap;
-use axum::{routing::get, Router};
 use futures_util::{SinkExt, StreamExt};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
     config::Backend,
-    handlers::ws_proxy,
     health::HealthState,
     mock::MockKeyStore,
+    router::ws_router,
     state::{AppState, RouterState, RuntimeBackend},
 };
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -44,6 +43,14 @@ async fn start_echo_backend() -> String {
 }
 
 async fn start_router(ws_url: Option<String>, healthy: bool) -> SocketAddr {
+    start_router_inner(ws_url, healthy, 0).await
+}
+
+async fn start_router_with_cap(ws_url: Option<String>, cap: u32) -> SocketAddr {
+    start_router_inner(ws_url, true, cap).await
+}
+
+async fn start_router_inner(ws_url: Option<String>, healthy: bool, cap: u32) -> SocketAddr {
     let https = HttpsConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
@@ -59,16 +66,15 @@ async fn start_router(ws_url: Option<String>, healthy: bool) -> SocketAddr {
         healthy,
     );
     let health_state = Arc::new(HealthState::new(vec!["echo".into()]));
-    let state = Arc::new(AppState {
+    let mut router_state = RouterState::simple(vec![backend], health_state);
+    router_state.proxy.max_ws_connections_per_key = cap;
+    let state = Arc::new(AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(RouterState::simple(
-            vec![backend],
-            health_state,
-        ))),
-    });
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    ));
 
-    let app = Router::new().route("/", get(ws_proxy)).with_state(state);
+    let app = ws_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -157,4 +163,26 @@ async fn ws_no_backend_returns_503() {
         }
         other => panic!("unexpected error: {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn ws_per_key_connection_cap() {
+    let backend = start_echo_backend().await;
+    let router = start_router_with_cap(Some(backend), 2).await;
+    let url = format!("ws://{}/?api-key=ws-key", router);
+
+    let (_a, _) = connect_async(&url).await.expect("first");
+    let (_b, _) = connect_async(&url).await.expect("second");
+    let err = connect_async(&url)
+        .await
+        .expect_err("third must be refused");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 429),
+        other => panic!("unexpected error: {:?}", other),
+    }
+
+    // Closing one frees a slot.
+    drop(_a);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (_c, _) = connect_async(&url).await.expect("slot freed");
 }

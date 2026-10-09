@@ -1,31 +1,23 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
-use axum::{
-    middleware,
-    routing::{get, post},
-    Router,
-};
 use clap::Parser;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sol_rpc_router::{
     config::load_config,
-    handlers::{
-        extract_rpc_method, health_endpoint, log_requests, proxy, request_id, track_metrics,
-        ws_proxy,
-    },
     health::{health_check_loop, HealthState},
     keystore::RedisKeyStore,
+    router::{http_router, metrics_router, ws_router},
     state::{AppState, RouterState},
+    upstream::redact_url,
 };
 use tokio::{
     net::TcpListener,
     signal::unix::{signal, SignalKind},
     sync::watch,
 };
-use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -65,9 +57,13 @@ async fn main() {
         info!(
             "  - [{}] {} (weight: {}, ws: {})",
             backend.label,
-            backend.url,
+            redact_url(&backend.url),
             backend.weight,
-            backend.ws_url.is_some()
+            backend
+                .ws_url
+                .as_deref()
+                .map(redact_url)
+                .unwrap_or_else(|| "none".into())
         );
     }
     if !config.method_routes.is_empty() {
@@ -105,11 +101,11 @@ async fn main() {
     };
     info!("Connected to Redis");
 
-    let state = Arc::new(AppState {
-        client: client.clone(),
-        keystore: Arc::new(keystore),
-        state: router_state.clone(),
-    });
+    let state = Arc::new(AppState::new(
+        client.clone(),
+        Arc::new(keystore),
+        router_state.clone(),
+    ));
 
     // Background health checks.
     {
@@ -160,28 +156,9 @@ async fn main() {
         });
     }
 
-    // HTTP server (JSON-RPC over HTTP + WebSocket upgrade on the same port).
-    let http_app = Router::new()
-        .route("/", get(ws_proxy).post(proxy))
-        .route("/*path", post(proxy))
-        .route("/health", get(health_endpoint))
-        .with_state(state.clone())
-        .layer(middleware::from_fn(track_metrics))
-        .layer(middleware::from_fn(log_requests))
-        .layer(middleware::from_fn(extract_rpc_method))
-        .layer(middleware::from_fn(request_id))
-        .layer(CorsLayer::permissive());
-
-    // Dedicated WebSocket server (Solana convention: WS port = HTTP port + 1).
-    let ws_app = Router::new()
-        .route("/", get(ws_proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(log_requests))
-        .layer(middleware::from_fn(request_id))
-        .layer(CorsLayer::permissive());
-
-    let metrics_app =
-        Router::new().route("/metrics", get(move || std::future::ready(handle.render())));
+    let http_app = http_router(state.clone());
+    let ws_app = ws_router(state);
+    let metrics_app = metrics_router(handle);
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let ws_port = config

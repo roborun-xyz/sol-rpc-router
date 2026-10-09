@@ -3,6 +3,7 @@ pub mod handlers;
 pub mod health;
 pub mod keystore;
 pub mod mock;
+pub mod router;
 pub mod rpc;
 pub mod state;
 pub mod upstream;

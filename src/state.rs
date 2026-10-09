@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -195,9 +195,48 @@ pub struct AppState {
     pub client: HttpClient,
     pub keystore: Arc<dyn KeyStore>,
     pub state: Arc<ArcSwap<RouterState>>,
+    /// Open WebSocket sessions per owner, for the per-key cap.
+    pub ws_sessions: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl AppState {
+    pub fn new(
+        client: HttpClient,
+        keystore: Arc<dyn KeyStore>,
+        state: Arc<ArcSwap<RouterState>>,
+    ) -> Self {
+        Self {
+            client,
+            keystore,
+            state,
+            ws_sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Reserves a WebSocket slot for `owner` if under `limit` (0 = unlimited).
+    /// Returns a guard that releases the slot when dropped.
+    pub fn try_open_ws_session(&self, owner: &str, limit: u32) -> Option<WsSessionGuard> {
+        let mut sessions = self.ws_sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let count = sessions.entry(owner.to_string()).or_insert(0);
+        if limit != 0 && *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(WsSessionGuard {
+            owner: owner.to_string(),
+            sessions: self.ws_sessions.clone(),
+        })
+    }
+
+    pub fn ws_session_count(&self, owner: &str) -> u32 {
+        self.ws_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(owner)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn select_backend(&self, rpc_method: Option<&str>) -> Option<(String, String)> {
         self.state
             .load()
@@ -210,5 +249,23 @@ impl AppState {
             .load()
             .select_ws_backend()
             .map(|s| (s.label, s.url))
+    }
+}
+
+/// Releases a per-owner WebSocket slot on drop.
+pub struct WsSessionGuard {
+    owner: String,
+    sessions: Arc<Mutex<HashMap<String, u32>>>,
+}
+
+impl Drop for WsSessionGuard {
+    fn drop(&mut self) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = sessions.get_mut(&self.owner) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                sessions.remove(&self.owner);
+            }
+        }
     }
 }

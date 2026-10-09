@@ -14,8 +14,7 @@ use arc_swap::ArcSwap;
 use axum::{
     body::{Body, Bytes},
     http::{HeaderMap, Request, StatusCode},
-    middleware,
-    routing::{get, post},
+    routing::post,
     Router,
 };
 use http_body_util::BodyExt;
@@ -23,12 +22,10 @@ use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
     config::{Backend, ProxyConfig},
-    handlers::{
-        extract_rpc_method, health_endpoint, proxy, request_id, ATTEMPTS_HEADER, BACKEND_HEADER,
-        REQUEST_ID_HEADER,
-    },
+    handlers::{ATTEMPTS_HEADER, BACKEND_HEADER, REQUEST_ID_HEADER},
     health::HealthState,
     mock::MockKeyStore,
+    router::http_router,
     state::{AppState, RouterState, RuntimeBackend},
 };
 use tower::ServiceExt;
@@ -127,20 +124,16 @@ fn build_app(
     router_state.blocked_methods = proxy_cfg.blocked_methods.iter().cloned().collect();
     router_state.proxy = proxy_cfg;
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         client,
-        keystore: keystore.clone(),
-        state: Arc::new(ArcSwap::from_pointee(router_state)),
-    });
+        keystore.clone(),
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    ));
 
-    let router = Router::new()
-        .route("/", post(proxy))
-        .route("/health", get(health_endpoint))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method))
-        .layer(middleware::from_fn(request_id));
-
-    TestApp { router, keystore }
+    TestApp {
+        router: http_router(state),
+        keystore,
+    }
 }
 
 fn rpc_request(uri: &str, method: &str) -> Request<Body> {
@@ -197,7 +190,7 @@ async fn auth_via_bearer_token() {
 }
 
 #[tokio::test]
-async fn auth_failure_returns_jsonrpc_error_with_id() {
+async fn auth_failure_returns_jsonrpc_error_without_reading_body() {
     let app = build_app(vec![], HashMap::new(), fast_proxy(0));
     let resp = app
         .router
@@ -207,7 +200,8 @@ async fn auth_failure_returns_jsonrpc_error_with_id() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let json = body_json(resp).await;
     assert_eq!(json["jsonrpc"], "2.0");
-    assert_eq!(json["id"], 1);
+    // Auth runs before the body is read, so the id is not known yet.
+    assert!(json["id"].is_null());
     assert_eq!(json["error"]["code"], -32001);
 }
 
@@ -643,18 +637,15 @@ async fn sub_path_and_extra_query_are_forwarded() {
     let keystore = Arc::new(MockKeyStore::new());
     keystore.add_key("test-key", "tester", 100);
     let health_state = Arc::new(HealthState::new(vec!["b".into()]));
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(RouterState::simple(
+        Arc::new(ArcSwap::from_pointee(RouterState::simple(
             vec![backend("b", &backend_url, 1)],
             health_state,
         ))),
-    });
-    let router = Router::new()
-        .route("/*path", post(proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method));
+    ));
+    let router = http_router(state);
 
     let resp = router
         .oneshot(rpc_request("/extra?api-key=test-key&foo=bar", "getSlot"))
@@ -704,4 +695,37 @@ async fn upstream_cookies_are_not_passed_to_clients() {
         resp.headers().get("content-type").unwrap(),
         "application/json"
     );
+}
+
+#[tokio::test]
+async fn unauthenticated_request_body_is_never_read() {
+    // A body stream that panics if polled proves auth happens first.
+    let app = build_app(vec![], HashMap::new(), fast_proxy(0));
+    let body = Body::from_stream(futures_util::stream::once(async {
+        panic!("body must not be read for an unauthenticated request");
+        #[allow(unreachable_code)]
+        Ok::<Bytes, std::io::Error>(Bytes::new())
+    }));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/?api-key=nope")
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    let resp = app.router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn overlong_key_is_rejected() {
+    let app = build_app(vec![], HashMap::new(), fast_proxy(0));
+    let key = "k".repeat(129);
+    let resp = app
+        .router
+        .oneshot(rpc_request(&format!("/?api-key={}", key), "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // MockKeyStore is not consulted for overlong keys.
+    assert_eq!(app.keystore.get_call_count(&key), 0);
 }

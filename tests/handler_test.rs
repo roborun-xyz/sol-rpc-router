@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
     middleware,
-    routing::{get, post},
+    routing::post,
     Router,
 };
 use http_body_util::BodyExt;
@@ -14,9 +14,10 @@ use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
     config::Backend,
-    handlers::{extract_rpc_method, health_endpoint, proxy, RpcMethod},
+    handlers::{extract_rpc_method, RpcMethod},
     health::{BackendHealthStatus, HealthState},
     mock::MockKeyStore,
+    router::http_router,
     state::{AppState, RouterState, RuntimeBackend},
 };
 use tower::ServiceExt; // for oneshot
@@ -29,11 +30,11 @@ fn make_app_state(
 ) -> Arc<AppState> {
     let router_state = RouterState::simple(backends, health_state);
 
-    Arc::new(AppState {
+    Arc::new(AppState::new(
         client,
         keystore,
-        state: Arc::new(ArcSwap::from_pointee(router_state)),
-    })
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    ))
 }
 
 async fn start_mock_backend() -> String {
@@ -75,10 +76,7 @@ async fn test_proxy_handler_success() {
     let health_state = Arc::new(HealthState::new(vec!["mock-backend".to_string()]));
     let state = make_app_state(client, keystore, vec![runtime_backend], health_state);
 
-    let app = Router::new()
-        .route("/", post(proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method));
+    let app = http_router(state);
 
     let req = Request::builder()
         .method("POST")
@@ -108,10 +106,7 @@ async fn test_proxy_handler_unauthorized() {
     let health_state = Arc::new(HealthState::new(vec![]));
     let state = make_app_state(client, keystore, vec![], health_state);
 
-    let app = Router::new()
-        .route("/", post(proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method));
+    let app = http_router(state);
 
     let req = Request::builder()
         .method("POST")
@@ -140,10 +135,7 @@ async fn test_proxy_handler_rate_limited() {
     let health_state = Arc::new(HealthState::new(vec![]));
     let state = make_app_state(client, keystore, vec![], health_state);
 
-    let app = Router::new()
-        .route("/", post(proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method));
+    let app = http_router(state);
 
     let req = Request::builder()
         .method("POST")
@@ -167,10 +159,7 @@ async fn test_proxy_no_api_key() {
     let health_state = Arc::new(HealthState::new(vec![]));
     let state = make_app_state(client, keystore, vec![], health_state);
 
-    let app = Router::new()
-        .route("/", post(proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method));
+    let app = http_router(state);
 
     let req = Request::builder()
         .method("POST")
@@ -194,10 +183,7 @@ async fn test_proxy_keystore_internal_error() {
     let health_state = Arc::new(HealthState::new(vec![]));
     let state = make_app_state(client, keystore, vec![], health_state);
 
-    let app = Router::new()
-        .route("/", post(proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method));
+    let app = http_router(state);
 
     let req = Request::builder()
         .method("POST")
@@ -234,10 +220,7 @@ async fn test_proxy_no_healthy_backends() {
     let health_state = Arc::new(HealthState::new(vec!["sick-backend".to_string()]));
     let state = make_app_state(client, keystore, vec![runtime_backend], health_state);
 
-    let app = Router::new()
-        .route("/", post(proxy))
-        .with_state(state)
-        .layer(middleware::from_fn(extract_rpc_method));
+    let app = http_router(state);
 
     let req = Request::builder()
         .method("POST")
@@ -290,9 +273,7 @@ fn test_backends() -> Vec<Backend> {
 #[tokio::test]
 async fn test_health_endpoint_all_healthy() {
     let state = make_health_state(&test_backends());
-    let app = Router::new()
-        .route("/health", get(health_endpoint))
-        .with_state(state);
+    let app = http_router(state);
 
     let req = Request::builder()
         .uri("/health")
@@ -323,9 +304,7 @@ async fn test_health_endpoint_mixed() {
         .health_state
         .update_status("b", unhealthy);
 
-    let app = Router::new()
-        .route("/health", get(health_endpoint))
-        .with_state(state);
+    let app = http_router(state);
 
     let req = Request::builder()
         .uri("/health")
@@ -356,9 +335,7 @@ async fn test_health_endpoint_all_unhealthy() {
         loaded.health_state.update_status(label, unhealthy);
     }
 
-    let app = Router::new()
-        .route("/health", get(health_endpoint))
-        .with_state(state);
+    let app = http_router(state);
 
     let req = Request::builder()
         .uri("/health")
