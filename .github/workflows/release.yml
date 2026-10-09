@@ -9,8 +9,19 @@ permissions:
   packages: write
 
 jobs:
+  release:
+    name: create github release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   binaries:
     name: ${{ matrix.target }}
+    needs: release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,6 +49,7 @@ jobs:
 
   image:
     name: container image
+    needs: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
