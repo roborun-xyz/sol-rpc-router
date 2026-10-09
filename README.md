@@ -15,13 +15,13 @@ You have a Helius key, a Triton key, a QuickNode key and the public RPC. Your bo
 `sol-rpc-router` is that layer:
 
 - **Automatic failover.** Connection errors, timeouts, 429s and 5xxs are retried on a different healthy backend. Clients see one response.
-- **`sendTransaction` fan-out.** Broadcast a transaction to every healthy backend at once and return the first success. More leaders see your tx sooner.
+- **`sendTransaction` fan-out.** Broadcast a transaction to every healthy backend at once and return the first success, so the transaction reaches every provider you have, not just the one the dice picked.
 - **Consensus-aware health checks.** A backend that falls more than N slots behind the best one is pulled from rotation until it catches up.
 - **Per-key auth and rate limits.** Keys live in Redis. Give each bot, friend or service its own key, RPS budget and expiry. Revoke in one command.
 - **Method blocklist and routing.** Keep `getProgramAccounts` off the shared endpoint, or pin DAS calls to the one provider that supports them.
 - **WebSockets too.** Subscriptions go through the same auth and backend selection.
 - **Observability built in.** Prometheus metrics, a Grafana dashboard, a `/health` endpoint with per-backend slot and latency, and `x-rpc-backend` / `x-request-id` headers on every response.
-- **Fast.** About 77k req/s in-process at p99 1.3 ms on a laptop. The router will not be your bottleneck.
+- **Fast.** About 77k req/s in-process at p99 1.3 ms on an Apple M3 Pro laptop (see [Benchmark](#benchmark)). The router will not be your bottleneck.
 
 ## Quick start
 
@@ -267,7 +267,7 @@ Request logs are one line per request with method, status, duration, backend, ow
 - Expose `port` (and `port+1` if you want the dedicated WS listener). Keep `metrics_port` and Redis private.
 - Run as many router instances as you like against one Redis; rate limits stay consistent.
 - `SIGTERM` stops accepting connections, drains in-flight requests for `shutdown_grace_secs`, then exits. Long-lived WebSocket sessions are cut at the deadline.
-- Memory and CPU are small; a single core handles tens of thousands of requests per second.
+- CPU needs are small: with the benchmark process pinned to one tokio worker thread (router, mock upstream and load generator all sharing it) it still does about 38k req/s.
 
 ## Benchmark
 
@@ -282,7 +282,7 @@ P99 Latency:     1.32ms
 P99.9 Latency:   1.71ms
 ```
 
-Apple M-series laptop, release profile with LTO.
+Apple M3 Pro (11 cores), release profile with LTO, measured 2026-10-08. Same run with `TOKIO_WORKER_THREADS=1`: 38k req/s, p99 1.0 ms.
 
 ## Development
 
