@@ -664,3 +664,44 @@ async fn sub_path_and_extra_query_are_forwarded() {
     let json = body_json(resp).await;
     assert_eq!(json["result"], "foo=bar");
 }
+
+#[tokio::test]
+async fn upstream_cookies_are_not_passed_to_clients() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [
+                        ("set-cookie", "__cf_bm=secret; Path=/"),
+                        ("content-type", "application/json"),
+                        ("x-upstream-custom", "kept"),
+                    ],
+                    r#"{"result":1}"#,
+                )
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let app = build_app(
+        vec![backend("b", &format!("http://{}", addr), 1)],
+        HashMap::new(),
+        fast_proxy(0),
+    );
+    let resp = app
+        .router
+        .oneshot(rpc_request("/?api-key=test-key", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("set-cookie").is_none());
+    assert_eq!(resp.headers().get("x-upstream-custom").unwrap(), "kept");
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+}

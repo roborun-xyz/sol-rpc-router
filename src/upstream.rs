@@ -115,6 +115,16 @@ pub fn forwardable_headers(client_headers: &HeaderMap, uri: &Uri) -> HeaderMap {
     out
 }
 
+/// Removes headers from an upstream response that must not reach the client:
+/// hop-by-hop headers (hyper re-frames the body itself) and `set-cookie`,
+/// which would leak provider/CDN session state across backends.
+pub fn sanitize_response_headers(headers: &mut HeaderMap) {
+    for name in HOP_BY_HOP_HEADERS.iter() {
+        headers.remove(name);
+    }
+    headers.remove(header::SET_COOKIE);
+}
+
 /// Builds a fresh POST request for one upstream attempt.
 pub fn build_request(uri: Uri, headers: &HeaderMap, body: Bytes) -> Request<Body> {
     let mut req = Request::builder()
@@ -212,6 +222,30 @@ mod tests {
         assert_eq!(out.get(header::HOST).unwrap(), "rpc.example.com:8443");
         assert_eq!(out.get(header::CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(out.get("x-request-id").unwrap(), "abc");
+    }
+
+    #[test]
+    fn sanitize_response_strips_cookies_and_hop_by_hop() {
+        let mut h = HeaderMap::new();
+        h.append(header::SET_COOKIE, HeaderValue::from_static("__cf_bm=abc"));
+        h.append(header::SET_COOKIE, HeaderValue::from_static("other=1"));
+        h.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        h.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        h.insert("x-rpc-backend", HeaderValue::from_static("helius"));
+
+        sanitize_response_headers(&mut h);
+        assert!(h.get_all(header::SET_COOKIE).iter().next().is_none());
+        assert!(h.get(header::TRANSFER_ENCODING).is_none());
+        assert!(h.get(header::CONNECTION).is_none());
+        assert_eq!(h.get(header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(h.get("x-rpc-backend").unwrap(), "helius");
     }
 
     #[test]

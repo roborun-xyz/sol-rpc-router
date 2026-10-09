@@ -307,8 +307,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
             println!("Found {} key(s):", rows.len());
             println!(
-                "{:<34} {:<20} {:<8} {:<12} {}",
-                "KEY", "OWNER", "STATUS", "RATE LIMIT", "EXPIRES"
+                "{:<34} {:<20} {:<8} {:<12} EXPIRES",
+                "KEY", "OWNER", "STATUS", "RATE LIMIT"
             );
             for (key, owner, status, rl, exp) in rows {
                 println!("{:<34} {:<20} {:<8} {:<12} {}", key, owner, status, rl, exp);

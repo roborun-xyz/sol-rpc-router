@@ -357,6 +357,7 @@ async fn send_once(
 }
 
 fn tag_response(mut resp: Response, backend: &str, owner: &str, attempts: u32) -> Response {
+    upstream::sanitize_response_headers(resp.headers_mut());
     resp.extensions_mut()
         .insert(SelectedBackend(backend.to_string()));
     resp.extensions_mut().insert(ClientOwner(owner.to_string()));
