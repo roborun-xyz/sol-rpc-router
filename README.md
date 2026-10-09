@@ -5,7 +5,7 @@ updated: 2026-10-08
 
 # sol-rpc-router
 
-[![CI](https://github.com/glamsystems/sol-rpc-router/actions/workflows/ci.yml/badge.svg)](https://github.com/glamsystems/sol-rpc-router/actions/workflows/ci.yml)
+[![CI](https://github.com/roborun-xyz/sol-rpc-router/actions/workflows/ci.yml/badge.svg)](https://github.com/roborun-xyz/sol-rpc-router/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 One URL in front of all your Solana RPC providers. Written in Rust, built for bots.
@@ -28,7 +28,7 @@ You have a Helius key, a Triton key, a QuickNode key and the public RPC. Your bo
 ### Docker Compose (router + Redis + Prometheus + Grafana)
 
 ```bash
-git clone https://github.com/glamsystems/sol-rpc-router && cd sol-rpc-router
+git clone https://github.com/roborun-xyz/sol-rpc-router && cd sol-rpc-router
 cp config.example.toml config.toml        # put your provider URLs in here
 docker compose up -d --build
 docker compose exec router rpc-admin create my-bot --rate-limit 100
@@ -44,7 +44,7 @@ cargo build --release
 ./target/release/rpc-admin create my-bot --rate-limit 100
 ```
 
-Pre-built binaries and a multi-arch container image (`ghcr.io/glamsystems/sol-rpc-router`) are attached to each [release](https://github.com/glamsystems/sol-rpc-router/releases).
+Tagged releases publish pre-built binaries (Linux and macOS, x86_64 and arm64) and a multi-arch container image at `ghcr.io/roborun-xyz/sol-rpc-router`; see the [releases page](https://github.com/roborun-xyz/sol-rpc-router/releases).
 
 ## Using it
 

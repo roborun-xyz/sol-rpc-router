@@ -3,6 +3,7 @@
 
 # Environment variables (contains secrets)
 config.toml
+debug_config.toml
 
 # IDE
 .vscode/

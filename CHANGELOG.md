@@ -28,6 +28,7 @@ All notable changes to this project are documented here. The format follows
 - Config validation for backend URL schemes and fan-out/blocked conflicts.
 
 ### Changed
+- Removed the unused `debug_config.toml` scratch config (it never referenced a required field and nothing used it).
 - All router-generated error bodies are JSON-RPC shaped and carry the request `id`; 429 responses include `Retry-After`.
 - `rpc_method` metric label is bounded to known Solana methods (`other` otherwise) to prevent cardinality blow-up.
 - Backend URLs that carry their own query string are merged correctly with client sub-paths and query parameters.
@@ -36,6 +37,7 @@ All notable changes to this project are documented here. The format follows
 - `Cargo.lock` is committed; release profile enables LTO and symbol stripping.
 
 ### Fixed
+- Repository links point at `roborun-xyz`, where the project now lives.
 - `expires_at` set by `rpc-admin` was stored but never enforced; expired keys are now rejected.
 - WebSocket backend connects are bounded by a 10 s timeout instead of hanging the upgrade.
 
