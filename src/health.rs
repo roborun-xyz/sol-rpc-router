@@ -9,7 +9,7 @@ use axum::{body::Body, http::Request};
 use futures_util::future;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use metrics::gauge;
+use metrics::{gauge, histogram};
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::{
@@ -24,6 +24,11 @@ pub struct BackendHealthStatus {
     pub consecutive_failures: u32,
     pub consecutive_successes: u32,
     pub last_error: Option<String>,
+    /// Last slot (or block height) reported by the backend, if the probe
+    /// method returns one.
+    pub slot: Option<u64>,
+    /// Round-trip time of the last probe.
+    pub latency_ms: Option<u64>,
 }
 
 impl Default for BackendHealthStatus {
@@ -34,6 +39,8 @@ impl Default for BackendHealthStatus {
             consecutive_failures: 0,
             consecutive_successes: 0,
             last_error: None,
+            slot: None,
+            latency_ms: None,
         }
     }
 }
@@ -174,8 +181,9 @@ pub async fn health_check_loop(
                 let config = backend.config.clone();
                 let hc = health_config.clone();
                 async move {
+                    let started = std::time::Instant::now();
                     let result = perform_health_check(&client, &config, &hc).await;
-                    (config.label.clone(), result)
+                    (config.label.clone(), result, started.elapsed())
                 }
             })
             .collect();
@@ -185,22 +193,36 @@ pub async fn health_check_loop(
         // Collect slot numbers from successful checks to determine the max (consensus tip)
         let max_slot: Option<u64> = results
             .iter()
-            .filter_map(|(_, result)| match result {
+            .filter_map(|(_, result, _)| match result {
                 Ok(Some(slot)) => Some(*slot),
                 _ => None,
             })
             .max();
 
-        for (i, (label, check_result)) in results.into_iter().enumerate() {
+        for (i, (label, check_result, elapsed)) in results.into_iter().enumerate() {
             let backend = &current_state.backends[i];
+            let latency_ms = elapsed.as_millis() as u64;
+            histogram!("rpc_backend_health_check_duration_seconds", "backend" => label.clone())
+                .record(elapsed.as_secs_f64());
 
             // Get current status from the detailed state
             let mut current_status = health_state.get_status(&label).unwrap_or_default();
 
             let previous_healthy = current_status.healthy;
 
+            current_status.latency_ms = Some(latency_ms);
+
             match check_result {
                 Ok(slot_opt) => {
+                    if let Some(slot) = slot_opt {
+                        current_status.slot = Some(slot);
+                        gauge!("rpc_backend_slot", "backend" => label.clone()).set(slot as f64);
+                        if let Some(max) = max_slot {
+                            gauge!("rpc_backend_slot_lag", "backend" => label.clone())
+                                .set(max.saturating_sub(slot) as f64);
+                        }
+                    }
+
                     // Check for slot lag against consensus
                     let lagging = matches!(
                         (slot_opt, max_slot),

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -87,13 +86,7 @@ async fn start_router(upstream_addr: SocketAddr) -> SocketAddr {
 
     let health_state = Arc::new(HealthState::new(vec!["mock-upstream".to_string()]));
 
-    let router_state = RouterState {
-        backends: vec![runtime_backend],
-        method_routes: HashMap::new(),
-        health_state: health_state.clone(),
-        proxy_timeout_secs: 30,
-        health_check_config: sol_rpc_router::config::HealthCheckConfig::default(),
-    };
+    let router_state = RouterState::simple(vec![runtime_backend], health_state.clone());
 
     let state = Arc::new(AppState {
         client,

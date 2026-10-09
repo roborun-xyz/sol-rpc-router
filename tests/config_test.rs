@@ -301,3 +301,141 @@ weight = 1
         err
     );
 }
+
+#[test]
+fn test_load_config_proxy_options() {
+    let path = write_temp_config(
+        "proxy_options",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+
+[proxy]
+timeout_secs = 7
+max_retries = 1
+fanout_methods = ["sendTransaction"]
+blocked_methods = ["getProgramAccounts"]
+"#,
+    );
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.proxy.timeout_secs, 7);
+    assert_eq!(config.proxy.max_retries, 1);
+    assert_eq!(config.proxy.fanout_methods, vec!["sendTransaction"]);
+    assert_eq!(config.proxy.blocked_methods, vec!["getProgramAccounts"]);
+}
+
+#[test]
+fn test_load_config_defaults_for_proxy() {
+    let path = write_temp_config(
+        "proxy_defaults",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#,
+    );
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.proxy.timeout_secs, 30);
+    assert_eq!(config.proxy.max_retries, 2);
+    assert!(config.proxy.fanout_methods.is_empty());
+    assert!(config.proxy.blocked_methods.is_empty());
+}
+
+#[test]
+fn test_load_config_fanout_and_blocked_conflict() {
+    let path = write_temp_config(
+        "fanout_blocked_conflict",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+
+[proxy]
+fanout_methods = ["sendTransaction"]
+blocked_methods = ["sendTransaction"]
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(err.to_string().contains("both fanned out and blocked"));
+}
+
+#[test]
+fn test_load_config_rejects_bad_backend_scheme() {
+    let path = write_temp_config(
+        "bad_scheme",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "localhost:9000"
+weight = 1
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(err.to_string().contains("http://"));
+}
+
+#[test]
+fn test_load_config_rejects_bad_ws_scheme() {
+    let path = write_temp_config(
+        "bad_ws_scheme",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+ws_url = "http://localhost:9000"
+weight = 1
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(err.to_string().contains("ws://"));
+}
+
+#[test]
+fn test_validate_config_redis_url_override() {
+    use sol_rpc_router::config::{validate_config, Config};
+
+    let config: Config = toml::from_str(
+        r#"
+port = 8080
+metrics_port = 9091
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#,
+    )
+    .unwrap();
+
+    // Without an override an empty redis_url is rejected...
+    let err = validate_config(config.clone(), None).unwrap_err();
+    assert!(err.to_string().contains("REDIS_URL"));
+
+    // ...and with one it is used.
+    let config = validate_config(config, Some("redis://override:6379".into())).unwrap();
+    assert_eq!(config.redis_url, "redis://override:6379");
+}

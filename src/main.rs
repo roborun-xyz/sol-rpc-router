@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -15,21 +12,28 @@ use hyper_util::client::legacy::Client;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sol_rpc_router::{
     config::load_config,
-    handlers::{extract_rpc_method, health_endpoint, log_requests, proxy, track_metrics, ws_proxy},
+    handlers::{
+        extract_rpc_method, health_endpoint, log_requests, proxy, request_id, track_metrics,
+        ws_proxy,
+    },
     health::{health_check_loop, HealthState},
     keystore::RedisKeyStore,
-    state::{AppState, RouterState, RuntimeBackend},
+    state::{AppState, RouterState},
 };
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::{
+    net::TcpListener,
+    signal::unix::{signal, SignalKind},
+    sync::watch,
+};
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "rpc-router")]
-#[command(about = "RPC router with load balancing and health monitoring", long_about = None)]
+#[command(name = "sol-rpc-router", version)]
+#[command(about = "Solana JSON-RPC reverse proxy with auth, rate limiting, failover and metrics", long_about = None)]
 struct Args {
     /// Path to configuration file
-    #[arg(short, long, default_value = "config.toml")]
+    #[arg(short, long, default_value = "config.toml", env = "RPC_ROUTER_CONFIG")]
     config: String,
 }
 
@@ -37,9 +41,8 @@ struct Args {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Initialize Prometheus recorder with histogram buckets
-    // Using set_buckets makes the exporter emit true Prometheus histograms (_bucket/_sum/_count)
-    // instead of summaries, which is required for histogram_quantile() in Grafana.
+    // Explicit buckets make the exporter emit true Prometheus histograms
+    // (_bucket/_sum/_count), which histogram_quantile() in Grafana needs.
     let builder = PrometheusBuilder::new()
         .set_buckets(&[
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -49,58 +52,50 @@ async fn main() {
         .install_recorder()
         .expect("failed to install Prometheus recorder");
 
-    // Parse command-line arguments
     let args = Args::parse();
-
-    // Load configuration from TOML file
     let config = load_config(&args.config).expect("Failed to load router configuration");
 
-    info!("Loaded configuration from: {}", args.config);
-    info!("Redis URL configured (host redacted)");
-
+    info!(
+        "sol-rpc-router v{} loaded configuration from {}",
+        env!("CARGO_PKG_VERSION"),
+        args.config
+    );
     info!("Loaded {} backends", config.backends.len());
     for backend in &config.backends {
         info!(
-            "  - [{}] {} (weight: {})",
-            backend.label, backend.url, backend.weight
+            "  - [{}] {} (weight: {}, ws: {})",
+            backend.label,
+            backend.url,
+            backend.weight,
+            backend.ws_url.is_some()
         );
     }
-
     if !config.method_routes.is_empty() {
         info!("Method routing overrides:");
         for (method, label) in &config.method_routes {
             info!("  - {} -> {}", method, label);
         }
     }
+    info!(
+        "Proxy: timeout={}s max_retries={} fanout={:?} blocked={:?}",
+        config.proxy.timeout_secs,
+        config.proxy.max_retries,
+        config.proxy.fanout_methods,
+        config.proxy.blocked_methods
+    );
 
-    // Initialize runtime backends with atomic health status
-    let runtime_backends: Vec<RuntimeBackend> = config
-        .backends
-        .iter()
-        .map(|b| RuntimeBackend {
-            config: b.clone(),
-            healthy: Arc::new(AtomicBool::new(true)), // Default to healthy
-        })
-        .collect();
-
-    // Initialize health state
     let backend_labels: Vec<String> = config.backends.iter().map(|b| b.label.clone()).collect();
     let health_state = Arc::new(HealthState::new(backend_labels));
 
-    let initial_router_state = RouterState {
-        backends: runtime_backends,
-        method_routes: config.method_routes,
-        health_state: health_state.clone(),
-        proxy_timeout_secs: config.proxy.timeout_secs,
-        health_check_config: config.health_check.clone(),
-    };
-
-    let router_state = Arc::new(ArcSwap::from_pointee(initial_router_state));
+    let router_state = Arc::new(ArcSwap::from_pointee(RouterState::from_config(
+        &config,
+        health_state.clone(),
+        |_| true,
+    )));
 
     let https = HttpsConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
 
-    // Initialize Redis KeyStore
     let keystore = match RedisKeyStore::new(&config.redis_url).await {
         Ok(ks) => ks,
         Err(e) => {
@@ -108,6 +103,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    info!("Connected to Redis");
 
     let state = Arc::new(AppState {
         client: client.clone(),
@@ -115,88 +111,56 @@ async fn main() {
         state: router_state.clone(),
     });
 
-    // Spawn background health check task
-    let health_check_client = client.clone();
-    let health_check_state = router_state.clone();
+    // Background health checks.
+    {
+        let client = client.clone();
+        let router_state = router_state.clone();
+        tokio::spawn(async move {
+            info!("Starting health check loop");
+            health_check_loop(client, router_state).await;
+        });
+    }
 
-    tokio::spawn(async move {
-        info!("Starting health check loop");
-        // Loop will read config from state each iteration
-        health_check_loop(health_check_client, health_check_state).await;
-    });
-
-    // Spawn SIGHUP handler for hot reload
-    let reload_state = router_state.clone();
-    let config_path = args.config.clone();
-    // We keep the original health_state to preserve history across reloads if backends match
-    let persistent_health_state = health_state.clone();
-
-    tokio::spawn(async move {
-        let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
-
-        loop {
-            sighup.recv().await;
-            info!(
-                "Received SIGHUP, reloading configuration from {}",
-                config_path
-            );
-
-            match load_config(&config_path) {
-                Ok(new_config) => {
-                    info!("Configuration reloaded successfully");
-                    info!("New backend count: {}", new_config.backends.len());
-
-                    // Re-initialize runtime backends
-                    // We attempt to preserve health status if backend label matches
-                    let new_runtime_backends: Vec<RuntimeBackend> = new_config
-                        .backends
-                        .iter()
-                        .map(|b| {
-                            // Check if we have existing status for this label
-                            let is_healthy = if let Some(status) =
-                                persistent_health_state.get_status(&b.label)
-                            {
-                                status.healthy
-                            } else {
-                                true // Default new backends to healthy
-                            };
-
-                            RuntimeBackend {
-                                config: b.clone(),
-                                healthy: Arc::new(AtomicBool::new(is_healthy)),
-                            }
-                        })
-                        .collect();
-
-                    // Update method routes info
-                    if !new_config.method_routes.is_empty() {
-                        info!("Updated method routing overrides:");
-                        for (method, label) in &new_config.method_routes {
-                            info!("  - {} -> {}", method, label);
-                        }
+    // SIGHUP hot reload. Health history is kept for backends whose label is
+    // unchanged; new backends start healthy.
+    {
+        let router_state = router_state.clone();
+        let health_state = health_state.clone();
+        let config_path = args.config.clone();
+        tokio::spawn(async move {
+            let mut sighup =
+                signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
+            loop {
+                sighup.recv().await;
+                info!(
+                    "Received SIGHUP, reloading configuration from {}",
+                    config_path
+                );
+                match load_config(&config_path) {
+                    Ok(new_config) => {
+                        let new_state =
+                            RouterState::from_config(&new_config, health_state.clone(), |label| {
+                                health_state
+                                    .get_status(label)
+                                    .map(|s| s.healthy)
+                                    .unwrap_or(true)
+                            });
+                        info!(
+                            "Configuration reloaded: {} backends, {} method routes, fanout={:?}, blocked={:?}",
+                            new_state.backends.len(),
+                            new_state.method_routes.len(),
+                            new_config.proxy.fanout_methods,
+                            new_config.proxy.blocked_methods
+                        );
+                        router_state.store(Arc::new(new_state));
                     }
-
-                    // Create new router state
-                    let new_router_state = RouterState {
-                        backends: new_runtime_backends,
-                        method_routes: new_config.method_routes,
-                        health_state: persistent_health_state.clone(), // Reuse the persistent health state container
-                        proxy_timeout_secs: new_config.proxy.timeout_secs,
-                        health_check_config: new_config.health_check,
-                    };
-
-                    // Atomically swap the state
-                    reload_state.store(Arc::new(new_router_state));
-                    info!("Router state atomically swapped");
-                }
-                Err(e) => {
-                    error!("Failed to reload configuration: {}", e);
+                    Err(e) => error!("Failed to reload configuration: {}", e),
                 }
             }
-        }
-    });
+        });
+    }
 
-    // HTTP server (JSON-RPC over HTTP + WebSocket on same port)
+    // HTTP server (JSON-RPC over HTTP + WebSocket upgrade on the same port).
     let http_app = Router::new()
         .route("/", get(ws_proxy).post(proxy))
         .route("/*path", post(proxy))
@@ -205,16 +169,17 @@ async fn main() {
         .layer(middleware::from_fn(track_metrics))
         .layer(middleware::from_fn(log_requests))
         .layer(middleware::from_fn(extract_rpc_method))
+        .layer(middleware::from_fn(request_id))
         .layer(CorsLayer::permissive());
 
-    // WebSocket server (following Solana convention: WS port = HTTP port + 1)
+    // Dedicated WebSocket server (Solana convention: WS port = HTTP port + 1).
     let ws_app = Router::new()
         .route("/", get(ws_proxy))
         .with_state(state)
         .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn(request_id))
         .layer(CorsLayer::permissive());
 
-    // Metrics server (dedicated port)
     let metrics_app =
         Router::new().route("/metrics", get(move || std::future::ready(handle.render())));
 
@@ -226,44 +191,98 @@ async fn main() {
     let ws_addr = SocketAddr::from(([0, 0, 0, 0], ws_port));
     let metrics_addr = SocketAddr::from(([0, 0, 0, 0], config.metrics_port));
 
+    let http_listener = TcpListener::bind(http_addr)
+        .await
+        .expect("Failed to bind HTTP server");
+    let ws_listener = TcpListener::bind(ws_addr)
+        .await
+        .expect("Failed to bind WebSocket server");
+    let metrics_listener = TcpListener::bind(metrics_addr)
+        .await
+        .expect("Failed to bind Metrics server");
+
     info!("HTTP server listening on http://{}", http_addr);
     info!("WebSocket server listening on ws://{}", ws_addr);
-    info!("Metrics server listening on http://{}", metrics_addr);
-    info!("Health monitoring endpoint: http://{}/health", http_addr);
+    info!(
+        "Metrics server listening on http://{}/metrics",
+        metrics_addr
+    );
+    info!("Health endpoint: http://{}/health", http_addr);
 
-    // Start all servers concurrently
-    let http_server = async {
-        axum::serve(
-            tokio::net::TcpListener::bind(http_addr)
-                .await
-                .expect("Failed to bind HTTP server"),
-            http_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .expect("HTTP server error");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let wait_for_shutdown = |mut rx: watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|v| *v).await;
     };
 
-    let ws_server = async {
-        axum::serve(
-            tokio::net::TcpListener::bind(ws_addr)
-                .await
-                .expect("Failed to bind WebSocket server"),
-            ws_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .expect("WebSocket server error");
+    let http_server = axum::serve(
+        http_listener,
+        http_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+
+    let ws_server = axum::serve(
+        ws_listener,
+        ws_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+
+    let metrics_server = axum::serve(
+        metrics_listener,
+        metrics_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+
+    let servers = async {
+        let (h, w, m) = tokio::join!(http_server, ws_server, metrics_server);
+        if let Err(e) = h {
+            error!("HTTP server error: {}", e);
+        }
+        if let Err(e) = w {
+            error!("WebSocket server error: {}", e);
+        }
+        if let Err(e) = m {
+            error!("Metrics server error: {}", e);
+        }
     };
 
-    let metrics_server = async {
-        axum::serve(
-            tokio::net::TcpListener::bind(metrics_addr)
-                .await
-                .expect("Failed to bind Metrics server"),
-            metrics_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .expect("Metrics server error");
+    // Long-lived WebSocket sessions would otherwise keep the process alive
+    // forever after SIGTERM; cap the drain at the configured grace period.
+    let grace = Duration::from_secs(config.proxy.shutdown_grace_secs);
+    let forced_exit = async {
+        wait_for_shutdown(shutdown_rx.clone()).await;
+        info!(
+            "Shutdown requested, draining connections for up to {:?}",
+            grace
+        );
+        tokio::time::sleep(grace).await;
+        warn!("Grace period elapsed, exiting with open connections");
     };
 
-    tokio::join!(http_server, ws_server, metrics_server);
+    tokio::select! {
+        _ = servers => info!("All servers stopped cleanly"),
+        _ = forced_exit => {}
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to register Ctrl+C handler");
+    };
+    let terminate = async {
+        signal(SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler")
+            .recv()
+            .await;
+    };
+    tokio::select! {
+        _ = ctrl_c => info!("Received SIGINT"),
+        _ = terminate => info!("Received SIGTERM"),
+    }
 }

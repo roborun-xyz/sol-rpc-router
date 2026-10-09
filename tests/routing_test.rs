@@ -5,7 +5,7 @@ use arc_swap::ArcSwap;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
-    config::{Backend, HealthCheckConfig},
+    config::Backend,
     health::{BackendHealthStatus, HealthState},
     mock::MockKeyStore,
     state::{AppState, RouterState, RuntimeBackend},
@@ -42,13 +42,7 @@ fn create_test_state() -> AppState {
     let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
     let health_state = Arc::new(HealthState::new(backend_labels));
 
-    let router_state = RouterState {
-        backends,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 10,
-        health_check_config: HealthCheckConfig::default(),
-    };
+    let router_state = RouterState::simple(backends, health_state);
 
     AppState {
         client,
@@ -89,13 +83,7 @@ fn test_select_backend_weighted() {
         "secondary".to_string(),
     ]));
 
-    let router_state = RouterState {
-        backends,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 10,
-        health_check_config: HealthCheckConfig::default(),
-    };
+    let router_state = RouterState::simple(backends, health_state);
 
     let state = AppState {
         client,
@@ -157,11 +145,8 @@ fn test_select_backend_method_override() {
     method_routes.insert("eth_call".to_string(), "secondary".to_string());
 
     let router_state = RouterState {
-        backends,
         method_routes,
-        health_state,
-        proxy_timeout_secs: 10,
-        health_check_config: HealthCheckConfig::default(),
+        ..RouterState::simple(backends, health_state)
     };
 
     let state = AppState {
@@ -241,13 +226,7 @@ fn create_ws_test_state() -> AppState {
     let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
     let health_state = Arc::new(HealthState::new(backend_labels));
 
-    let router_state = RouterState {
-        backends,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 10,
-        health_check_config: HealthCheckConfig::default(),
-    };
+    let router_state = RouterState::simple(backends, health_state);
 
     AppState {
         client,

@@ -1,5 +1,5 @@
 use std::sync::atomic::AtomicBool;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -13,7 +13,7 @@ use http_body_util::BodyExt;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
-    config::{Backend, HealthCheckConfig},
+    config::Backend,
     handlers::{extract_rpc_method, health_endpoint, proxy, RpcMethod},
     health::{BackendHealthStatus, HealthState},
     mock::MockKeyStore,
@@ -27,13 +27,7 @@ fn make_app_state(
     backends: Vec<RuntimeBackend>,
     health_state: Arc<HealthState>,
 ) -> Arc<AppState> {
-    let router_state = RouterState {
-        backends,
-        method_routes: HashMap::new(),
-        health_state,
-        proxy_timeout_secs: 5,
-        health_check_config: HealthCheckConfig::default(),
-    };
+    let router_state = RouterState::simple(backends, health_state);
 
     Arc::new(AppState {
         client,
