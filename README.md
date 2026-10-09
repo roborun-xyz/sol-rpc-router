@@ -291,7 +291,7 @@ Request logs are one line per request with method, status, duration, backend, ow
 
 ## Benchmark
 
-`cargo run --release --bin benchmark -- -c 64 -d 10` starts a mock upstream and the router (the same router assembly the binary uses, middleware included) in one process and floods it, so the number is the router's own overhead with no network or Redis in the loop.
+`cargo run --release --bin sol-rpc-router-bench -- -c 64 -d 10` starts a mock upstream and the router (the same router assembly the binary uses, middleware included) in one process and floods it, so the number is the router's own overhead with no network or Redis in the loop.
 
 ```
 Concurrency:     64
@@ -328,7 +328,7 @@ src/
   keystore.rs    KeyStore trait, FileKeyStore (config keys, in-memory limits), RedisKeyStore
   router.rs      router assembly shared by the binary, benchmark and tests
   mock.rs        in-memory KeyStore for tests
-  bin/           rpc-admin, benchmark
+  bin/           rpc-admin, sol-rpc-router-bench
 tests/           integration tests (mock backends bind to 127.0.0.1:0)
 ```
 

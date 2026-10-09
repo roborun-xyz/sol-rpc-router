@@ -22,7 +22,7 @@ cargo clippy --all-targets # lint (CI uses -D warnings)
 TEST_REDIS_URL=redis://127.0.0.1:6379/15 cargo test --test redis_keystore_test
 
 # benchmark (in-process mock upstream, no Redis)
-cargo run --release --bin benchmark -- --concurrency 64 --duration 10
+cargo run --release --bin sol-rpc-router-bench -- --concurrency 64 --duration 10
 
 # full stack
 cp config.example.toml config.toml && docker compose up -d --build
@@ -52,7 +52,7 @@ src/
   mock.rs           MockKeyStore for testing (supports error injection via set_error())
   lib.rs            Module declarations
   bin/rpc-admin.rs  Admin CLI for API key CRUD
-  bin/benchmark.rs  In-process benchmark
+  bin/benchmark.rs  In-process benchmark (binary name: sol-rpc-router-bench)
 
 tests/
   config_test.rs          Config validation paths (incl. keystore selection)

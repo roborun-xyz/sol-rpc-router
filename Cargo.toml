@@ -9,6 +9,23 @@ repository = "https://github.com/roborun-xyz/sol-rpc-router"
 keywords = ["solana", "rpc", "proxy", "load-balancer", "json-rpc"]
 categories = ["network-programming", "web-programming::http-server"]
 readme = "README.md"
+# Keep the crate to what `cargo install` needs; deployment assets live in the repo.
+exclude = [
+    ".claude/",
+    ".github/",
+    ".dockerignore",
+    "Dockerfile",
+    "docker/",
+    "docker-compose.yml",
+    "grafana/",
+    "reload.sh",
+]
+
+# The in-process load generator; named so `cargo install` does not drop a
+# generic `benchmark` binary on PATH.
+[[bin]]
+name = "sol-rpc-router-bench"
+path = "src/bin/benchmark.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "ws"] }
