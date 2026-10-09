@@ -1,8 +1,3 @@
----
-created: 2026-02-07
-updated: 2026-10-08
----
-
 # sol-rpc-router
 
 [![CI](https://github.com/roborun-xyz/sol-rpc-router/actions/workflows/ci.yml/badge.svg)](https://github.com/roborun-xyz/sol-rpc-router/actions/workflows/ci.yml)

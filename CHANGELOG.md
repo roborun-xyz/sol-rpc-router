@@ -1,8 +1,3 @@
----
-created: 2026-10-08
-updated: 2026-10-08
----
-
 # Changelog
 
 All notable changes to this project are documented here. The format follows
