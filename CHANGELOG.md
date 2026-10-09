@@ -37,6 +37,7 @@ All notable changes to this project are documented here. The format follows
 - `/health` requests are excluded from request logs and metrics; the "routed backend unhealthy" fallback message is now `debug`.
 - Malformed `?api-key=` query strings fall back to header auth instead of a plain-text 400.
 - `KeyStore` returns a typed `KeyStoreError` instead of a string.
+- The in-process load generator binary is `sol-rpc-router-bench` (was `benchmark`); the published crate excludes deployment assets.
 - `rpc_method` metric label is bounded to known Solana methods (`other` otherwise) to prevent cardinality blow-up.
 - Backend URLs that carry their own query string are merged correctly with client sub-paths and query parameters.
 - Router credentials and hop-by-hop headers are stripped before forwarding upstream; `set-cookie` and hop-by-hop headers from upstream responses are stripped before reaching clients.
