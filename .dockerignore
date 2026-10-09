@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+grafana/
+*.md
+config.toml
+docker-compose.yml

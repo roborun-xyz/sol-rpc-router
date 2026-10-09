@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 
 # Environment variables (contains secrets)
 config.toml

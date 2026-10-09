@@ -1,0 +1,68 @@
+# One-command stack: router + Redis + Prometheus + Grafana.
+#
+#   cp config.example.toml config.toml   # edit backends
+#   docker compose up -d --build
+#   docker compose exec router rpc-admin create me --rate-limit 100
+#
+# Router:   http://localhost:28899   (WS on 28900)
+# Grafana:  http://localhost:3000    (admin / admin)
+# Metrics:  http://localhost:28901/metrics
+
+services:
+  router:
+    build: .
+    image: sol-rpc-router:local
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+    ports:
+      - "28899:28899"
+      - "28900:28900"
+      - "127.0.0.1:28901:28901"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:

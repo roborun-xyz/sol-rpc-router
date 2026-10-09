@@ -1,27 +1,41 @@
-port = 28899
-metrics_port = 28901
-redis_url = "redis://127.0.0.1:6379/0"
+# sol-rpc-router configuration
+# Copy to config.toml and edit. Reload a running router with SIGHUP (see reload.sh).
 
+port = 28899             # JSON-RPC over HTTP, plus WebSocket upgrades on the same port.
+                         # A dedicated WebSocket listener also runs on port + 1 (28900).
+metrics_port = 28901     # Prometheus metrics, keep this one off the public internet.
+redis_url = "redis://127.0.0.1:6379/0"   # Overridable with the REDIS_URL env var.
+
+# Backends are weighted; traffic is split proportionally among healthy ones.
+# URLs may carry their own query string (provider API keys) - the router merges
+# client sub-paths and query params correctly and never forwards its own keys.
 [[backends]]
-label = "mainnet-primary"
-url = "https://api.mainnet-beta.solana.com"
+label = "helius"
+url = "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
+ws_url = "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
 weight = 10
-ws_url = "wss://api.mainnet-beta.solana.com"   # optional
 
 [[backends]]
-label = "backup-rpc"
-url = "https://solana-api.com"
-weight = 5
+label = "public"
+url = "https://api.mainnet-beta.solana.com"
+ws_url = "wss://api.mainnet-beta.solana.com"
+weight = 1
 
 [proxy]
-timeout_secs = 30                     # upstream request timeout
+timeout_secs = 30                      # per-attempt upstream timeout
+max_retries = 2                        # extra backends to try on connect errors / timeouts / 408, 429, 5xx
+fanout_methods = ["sendTransaction"]   # broadcast to every healthy backend, first success wins
+blocked_methods = []                   # e.g. ["getProgramAccounts"] to keep heavy calls off a shared key
+shutdown_grace_secs = 10               # drain time after SIGTERM before forcing exit
 
 [health_check]
-interval_secs = 30                    # check frequency
-timeout_secs = 5                      # per-check timeout
-method = "getSlot"                    # RPC method used for probes
-consecutive_failures_threshold = 3    # failures before marking unhealthy
-consecutive_successes_threshold = 2   # successes before marking healthy
+interval_secs = 30                     # probe frequency
+timeout_secs = 5                       # per-probe timeout
+method = "getSlot"                     # probe method; getSlot/getBlockHeight also enable lag detection
+consecutive_failures_threshold = 3     # failures before a backend is pulled from rotation
+consecutive_successes_threshold = 2    # successes before it is put back
+max_slot_lag = 50                      # slots behind the best backend before it counts as failing
 
-[method_routes]                       # optional per-method overrides
-getSlot = "mainnet-primary"
+# Pin specific methods to a backend (falls back to weighted selection if it is unhealthy).
+[method_routes]
+getProgramAccounts = "helius"

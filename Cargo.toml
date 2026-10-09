@@ -1,7 +1,8 @@
 [package]
 name = "sol-rpc-router"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.80"
 description = "Solana JSON-RPC reverse proxy with API key auth, rate limiting, weighted load balancing, method-based routing, WebSocket proxying, health checking, and Prometheus metrics"
 license = "Apache-2.0"
 repository = "https://github.com/glamsystems/sol-rpc-router"
@@ -36,3 +37,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 tower = "0.5"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
