@@ -9,11 +9,15 @@ pub const REDIS_URL_ENV: &str = "REDIS_URL";
 pub struct Config {
     pub port: u16,
     pub metrics_port: u16,
-    /// Redis connection URL. Can be overridden with the `REDIS_URL` env var,
-    /// which is handy for container deployments where the config file is
-    /// baked into the image but Redis lives elsewhere.
+    /// Redis connection URL for the Redis keystore. Can be overridden with the
+    /// `REDIS_URL` env var. Leave empty to use `[[api_keys]]` from this file.
     #[serde(default)]
     pub redis_url: String,
+    /// Inline API keys. Used when `redis_url` is empty; keys are reloaded on
+    /// SIGHUP. Rate limits are enforced in-process, so this mode suits a
+    /// single router instance.
+    #[serde(default)]
+    pub api_keys: Vec<ApiKeyConfig>,
     pub backends: Vec<Backend>,
     #[serde(default)]
     pub method_routes: HashMap<String, String>,
@@ -84,6 +88,41 @@ impl Default for HealthCheckConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct ApiKeyConfig {
+    pub key: String,
+    pub owner: String,
+    /// Requests per second; `0` means unlimited.
+    #[serde(default)]
+    pub rate_limit: u64,
+    /// Unix seconds; `0` or absent means never.
+    #[serde(default)]
+    pub expires_at: u64,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Which keystore a config selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStoreKind {
+    Redis,
+    File,
+}
+
+impl Config {
+    pub fn keystore_kind(&self) -> KeyStoreKind {
+        if self.redis_url.is_empty() {
+            KeyStoreKind::File
+        } else {
+            KeyStoreKind::Redis
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct Backend {
     pub label: String,
     pub url: String,
@@ -112,12 +151,39 @@ pub fn validate_config(
         config.redis_url = url;
     }
 
-    if config.redis_url.is_empty() {
+    if config.redis_url.is_empty() && config.api_keys.is_empty() {
         return Err(format!(
-            "Redis URL must be configured (set `redis_url` in the config file or the {} env var)",
+            "No keystore configured: set `redis_url` (or the {} env var) for Redis-backed keys, or add [[api_keys]] entries to the config file",
             REDIS_URL_ENV
         )
         .into());
+    }
+    if !config.redis_url.is_empty() && !config.api_keys.is_empty() {
+        return Err(
+            "Both `redis_url` and [[api_keys]] are set; pick one keystore (Redis manages keys with rpc-admin, the file keystore reads them from this config)"
+                .into(),
+        );
+    }
+
+    let mut seen_keys = std::collections::HashSet::new();
+    for k in &config.api_keys {
+        if k.key.is_empty() {
+            return Err(format!("api_keys entry for owner '{}' has an empty key", k.owner).into());
+        }
+        if k.key.len() > crate::keystore::MAX_KEY_LEN {
+            return Err(format!(
+                "api_keys entry for owner '{}' is longer than {} bytes",
+                k.owner,
+                crate::keystore::MAX_KEY_LEN
+            )
+            .into());
+        }
+        if k.owner.is_empty() {
+            return Err("api_keys entry has an empty owner".into());
+        }
+        if !seen_keys.insert(k.key.as_str()) {
+            return Err(format!("Duplicate api_keys entry for owner '{}'", k.owner).into());
+        }
     }
     if config.backends.is_empty() {
         return Err("At least one backend must be configured".into());

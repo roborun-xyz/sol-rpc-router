@@ -37,21 +37,25 @@ src/
   main.rs           Entry point: CLI args, server setup, SIGHUP reload, graceful shutdown
   config.rs         TOML config structs + load_config()/validate_config()
   state.rs          RouterState (backends, routes, fanout/blocked sets), select_backend()
+  router.rs         http_router()/ws_router()/metrics_router(): the ONE place middleware order
+                    is defined; binary, benchmark and tests all use it
   handlers.rs       Axum handlers: proxy (retry + fan-out), ws_proxy, health_endpoint
-                    Middleware: request_id, extract_rpc_method, log_requests, track_metrics
+                    Middleware: request_id, require_api_key, extract_rpc_method, log_requests,
+                    track_metrics
   upstream.rs       build_uri() (merges backend query strings), forwardable_headers(),
                     is_retryable_status()
   rpc.rs            probe_request() (single + batch), error_response(), KNOWN_METHODS,
                     metric_label()
   health.rs         HealthState, BackendHealthStatus (slot, latency), health_check_loop
-  keystore.rs       KeyStore trait + RedisKeyStore (HGETALL + moka cache, expiry, Lua limiter)
+  keystore.rs       KeyStore trait, RedisKeyStore (HGETALL + bounded moka cache, Lua limiter),
+                    FileKeyStore (config [[api_keys]], in-memory per-second windows, reload())
   mock.rs           MockKeyStore for testing (supports error injection via set_error())
   lib.rs            Module declarations
   bin/rpc-admin.rs  Admin CLI for API key CRUD
   bin/benchmark.rs  In-process benchmark
 
 tests/
-  config_test.rs          Config validation paths
+  config_test.rs          Config validation paths (incl. keystore selection)
   handler_test.rs         Proxy errors, health endpoint, extract_rpc_method middleware
   proxy_features_test.rs  Header auth, credential stripping, failover, fan-out, blocked
                           methods, batches, request ids, sub-path forwarding
@@ -65,7 +69,9 @@ tests/
 
 - **State**: `AppState` is shared via `Arc<AppState>`; `AppState.state` is an `Arc<ArcSwap<RouterState>>` so SIGHUP reloads swap atomically. Build `RouterState` with `from_config()` (prod) or `simple()` (tests/bench).
 - **KeyStore trait**: `async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String>`. `Ok(Some)` valid, `Ok(None)` invalid/inactive/expired, `Err("Rate limit exceeded")` or `Err(other)`.
-- **Auth**: `handlers::authenticate()` is shared by HTTP and WS. Key sources: `?api-key=`, `x-api-key`, `Authorization: Bearer`. `upstream::forwardable_headers()` strips them before forwarding.
+- **Auth**: `require_api_key` middleware runs BEFORE `extract_rpc_method`, so bodies are never buffered for unauthenticated requests; it stores `ClientOwner` in request extensions and handlers read it (no auth inside handlers). Key sources: `?api-key=`, `x-api-key`, `Authorization: Bearer`. `upstream::forwardable_headers()` strips them before forwarding. Auth errors carry `id: null`.
+- **Keystore selection**: `Config::keystore_kind()`; empty `redis_url` + `[[api_keys]]` = file store, otherwise Redis. Setting both is a config error. SIGHUP reloads file keys via `FileKeyStore::reload()`.
+- **Secrets in logs**: always pass backend URLs through `upstream::redact_url()` before logging; provider keys live in their query strings.
 - **Proxy flow**: auth → blocked check → fan-out (if method listed) → retry loop via `RouterState::select_backend(method, &tried)`. Retryable = transport error, timeout, 408/429/5xx. Non-retryable upstream statuses pass through untouched.
 - **Fan-out**: sends are `tokio::spawn`ed and results arrive over an mpsc channel, so dropping the receiver after the first success does not cancel the remaining sends.
 - **Errors**: router-generated errors go through `rpc::error_response()` (JSON-RPC body with the request id). Keep HTTP status codes stable; tests assert on them.

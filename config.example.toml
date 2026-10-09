@@ -4,7 +4,17 @@
 port = 28899             # JSON-RPC over HTTP, plus WebSocket upgrades on the same port.
                          # A dedicated WebSocket listener also runs on port + 1 (28900).
 metrics_port = 28901     # Prometheus metrics, keep this one off the public internet.
+# Keystore: pick ONE.
+#  - Redis (below): keys managed with `rpc-admin`, limits shared across router instances.
+#  - Config file: leave redis_url empty and list keys under [[api_keys]]; reload with SIGHUP.
 redis_url = "redis://127.0.0.1:6379/0"   # Overridable with the REDIS_URL env var.
+
+# [[api_keys]]
+# key = "replace-with-a-long-random-string"
+# owner = "my-bot"
+# rate_limit = 100        # requests per second, 0 = unlimited
+# expires_at = 0          # unix seconds, 0 = never
+# active = true
 
 # Backends are weighted; traffic is split proportionally among healthy ones.
 # URLs may carry their own query string (provider API keys) - the router merges

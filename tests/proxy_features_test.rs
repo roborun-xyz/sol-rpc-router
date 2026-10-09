@@ -729,3 +729,71 @@ async fn overlong_key_is_rejected() {
     // MockKeyStore is not consulted for overlong keys.
     assert_eq!(app.keystore.get_call_count(&key), 0);
 }
+
+#[tokio::test]
+async fn file_keystore_end_to_end() {
+    use sol_rpc_router::{config::ApiKeyConfig, keystore::FileKeyStore};
+
+    let b = start_backend(ok_backend()).await;
+    let https = HttpsConnector::new();
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+    let keystore = Arc::new(FileKeyStore::new(&[ApiKeyConfig {
+        key: "file-key".into(),
+        owner: "filey".into(),
+        rate_limit: 2,
+        expires_at: 0,
+        active: true,
+    }]));
+    let health_state = Arc::new(HealthState::new(vec!["b".into()]));
+    let state = Arc::new(AppState::new(
+        client,
+        keystore.clone(),
+        Arc::new(ArcSwap::from_pointee(RouterState::simple(
+            vec![backend("b", &b.url, 1)],
+            health_state,
+        ))),
+    ));
+    let router = http_router(state);
+
+    // Two allowed, third limited within the same second.
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let resp = router
+            .clone()
+            .oneshot(rpc_request("/?api-key=file-key", "getSlot"))
+            .await
+            .unwrap();
+        statuses.push(resp.status());
+    }
+    assert_eq!(statuses[0], StatusCode::OK);
+    assert_eq!(statuses[1], StatusCode::OK);
+    assert_eq!(statuses[2], StatusCode::TOO_MANY_REQUESTS);
+
+    // Unknown key.
+    let resp = router
+        .clone()
+        .oneshot(rpc_request("/?api-key=other", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Hot reload replaces the key set.
+    keystore.reload(&[ApiKeyConfig {
+        key: "other".into(),
+        owner: "newbie".into(),
+        rate_limit: 0,
+        expires_at: 0,
+        active: true,
+    }]);
+    let resp = router
+        .clone()
+        .oneshot(rpc_request("/?api-key=other", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = router
+        .oneshot(rpc_request("/?api-key=file-key", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

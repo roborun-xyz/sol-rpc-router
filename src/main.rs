@@ -7,8 +7,9 @@ use hyper_util::client::legacy::Client;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sol_rpc_router::{
     config::load_config,
+    config::KeyStoreKind,
     health::{health_check_loop, HealthState},
-    keystore::RedisKeyStore,
+    keystore::{FileKeyStore, KeyStore, RedisKeyStore},
     router::{http_router, metrics_router, ws_router},
     state::{AppState, RouterState},
     upstream::redact_url,
@@ -92,18 +93,35 @@ async fn main() {
     let https = HttpsConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
 
-    let keystore = match RedisKeyStore::new(&config.redis_url).await {
-        Ok(ks) => ks,
-        Err(e) => {
-            error!("Failed to initialize Redis KeyStore: {}", e);
-            std::process::exit(1);
-        }
+    // Keystore: Redis (multi-instance, managed with rpc-admin) or the
+    // [[api_keys]] block in the config file (single instance, no Redis).
+    let file_keystore: Option<Arc<FileKeyStore>> = match config.keystore_kind() {
+        KeyStoreKind::File => Some(Arc::new(FileKeyStore::new(&config.api_keys))),
+        KeyStoreKind::Redis => None,
     };
-    info!("Connected to Redis");
+    let keystore: Arc<dyn KeyStore> = match &file_keystore {
+        Some(fks) => {
+            info!(
+                "Keystore: config file ({} key(s), rate limits enforced in-process)",
+                fks.len()
+            );
+            fks.clone()
+        }
+        None => match RedisKeyStore::new(&config.redis_url).await {
+            Ok(ks) => {
+                info!("Keystore: Redis");
+                Arc::new(ks)
+            }
+            Err(e) => {
+                error!("Failed to initialize Redis KeyStore: {}", e);
+                std::process::exit(1);
+            }
+        },
+    };
 
     let state = Arc::new(AppState::new(
         client.clone(),
-        Arc::new(keystore),
+        keystore,
         router_state.clone(),
     ));
 
@@ -123,6 +141,7 @@ async fn main() {
         let router_state = router_state.clone();
         let health_state = health_state.clone();
         let config_path = args.config.clone();
+        let file_keystore = file_keystore.clone();
         tokio::spawn(async move {
             let mut sighup =
                 signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
@@ -149,6 +168,16 @@ async fn main() {
                             new_config.proxy.blocked_methods
                         );
                         router_state.store(Arc::new(new_state));
+                        match (&file_keystore, new_config.keystore_kind()) {
+                            (Some(fks), KeyStoreKind::File) => {
+                                fks.reload(&new_config.api_keys);
+                                info!("Reloaded {} API key(s) from config", fks.len());
+                            }
+                            (Some(_), KeyStoreKind::Redis) | (None, KeyStoreKind::File) => warn!(
+                                "Keystore type changed in config; restart the router for that to take effect"
+                            ),
+                            (None, KeyStoreKind::Redis) => {}
+                        }
                     }
                     Err(e) => error!("Failed to reload configuration: {}", e),
                 }

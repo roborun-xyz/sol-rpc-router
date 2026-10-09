@@ -73,8 +73,8 @@ weight = 1
     );
     let err = load_config(&path).unwrap_err();
     assert!(
-        err.to_string().contains("Redis URL"),
-        "Expected 'Redis URL' in error: {}",
+        err.to_string().contains("No keystore configured"),
+        "Expected keystore error: {}",
         err
     );
 }
@@ -438,4 +438,115 @@ weight = 1
     // ...and with one it is used.
     let config = validate_config(config, Some("redis://override:6379".into())).unwrap();
     assert_eq!(config.redis_url, "redis://override:6379");
+}
+
+#[test]
+fn test_file_keystore_config_is_accepted_without_redis() {
+    let path = write_temp_config(
+        "file_keystore",
+        r#"
+port = 8080
+metrics_port = 9091
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+
+[[api_keys]]
+key = "abc123"
+owner = "alice"
+rate_limit = 25
+
+[[api_keys]]
+key = "def456"
+owner = "bob"
+"#,
+    );
+    let config = load_config(&path).unwrap();
+    assert_eq!(
+        config.keystore_kind(),
+        sol_rpc_router::config::KeyStoreKind::File
+    );
+    assert_eq!(config.api_keys.len(), 2);
+    assert_eq!(config.api_keys[0].rate_limit, 25);
+    assert_eq!(config.api_keys[1].rate_limit, 0);
+    assert!(config.api_keys[1].active);
+    assert_eq!(config.api_keys[1].expires_at, 0);
+}
+
+#[test]
+fn test_no_keystore_is_rejected() {
+    let path = write_temp_config(
+        "no_keystore",
+        r#"
+port = 8080
+metrics_port = 9091
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("No keystore configured"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn test_both_keystores_is_rejected() {
+    let path = write_temp_config(
+        "both_keystores",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+
+[[api_keys]]
+key = "abc123"
+owner = "alice"
+"#,
+    );
+    let err = load_config(&path).unwrap_err();
+    assert!(err.to_string().contains("pick one keystore"), "{}", err);
+}
+
+#[test]
+fn test_api_keys_validation() {
+    for (name, block, needle) in [
+        (
+            "dup",
+            "[[api_keys]]\nkey = \"a\"\nowner = \"x\"\n[[api_keys]]\nkey = \"a\"\nowner = \"y\"\n",
+            "Duplicate",
+        ),
+        (
+            "emptykey",
+            "[[api_keys]]\nkey = \"\"\nowner = \"x\"\n",
+            "empty key",
+        ),
+        (
+            "emptyowner",
+            "[[api_keys]]\nkey = \"a\"\nowner = \"\"\n",
+            "empty owner",
+        ),
+    ] {
+        let path = write_temp_config(
+            name,
+            &format!(
+                "port = 8080\nmetrics_port = 9091\n\n[[backends]]\nlabel = \"b1\"\nurl = \"http://localhost:9000\"\nweight = 1\n\n{}",
+                block
+            ),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(err.to_string().contains(needle), "{}: {}", name, err);
+    }
 }

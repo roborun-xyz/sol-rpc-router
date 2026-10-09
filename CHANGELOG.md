@@ -12,6 +12,8 @@ All notable changes to this project are documented here. The format follows
 ## [0.2.0] - 2026-10-08
 
 ### Added
+- File-based keystore: list keys under `[[api_keys]]` and leave `redis_url` empty to run without Redis (single instance, in-process limits, SIGHUP reload).
+- `proxy.max_ws_connections_per_key` caps concurrent WebSocket sessions per key (default 100).
 - Automatic failover: transport errors, timeouts and HTTP 408/429/5xx are retried on another healthy backend (`proxy.max_retries`).
 - `proxy.fanout_methods`: broadcast a call (typically `sendTransaction`) to every healthy backend, first success wins, upstream error surfaced otherwise.
 - `proxy.blocked_methods`: reject methods before they reach a backend (403 + JSON-RPC error), including inside batches.
@@ -35,6 +37,12 @@ All notable changes to this project are documented here. The format follows
 - Router credentials and hop-by-hop headers are stripped before forwarding upstream; `set-cookie` and hop-by-hop headers from upstream responses are stripped before reaching clients.
 - Key metadata is fetched with a single `HGETALL`; the rate-limit script is compiled once.
 - `Cargo.lock` is committed; release profile enables LTO and symbol stripping.
+
+### Security
+- Authentication now runs before the request body is read, so unauthenticated or rate-limited clients cannot make the router buffer up to 10 MB per request.
+- Backend URLs are redacted in logs and error messages; provider keys in `?api-key=` no longer appear in startup output.
+- The key lookup cache is bounded (10k entries) and keys over 128 bytes are rejected before any lookup.
+- Request body reads time out after 10 s.
 
 ### Fixed
 - Repository links point at `roborun-xyz`, where the project now lives.

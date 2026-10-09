@@ -17,7 +17,7 @@ You have a Helius key, a Triton key, a QuickNode key and the public RPC. Your bo
 - **Automatic failover.** Connection errors, timeouts, 429s and 5xxs are retried on a different healthy backend. Clients see one response.
 - **`sendTransaction` fan-out.** Broadcast a transaction to every healthy backend at once and return the first success, so the transaction reaches every provider you have, not just the one the dice picked.
 - **Consensus-aware health checks.** A backend that falls more than N slots behind the best one is pulled from rotation until it catches up.
-- **Per-key auth and rate limits.** Keys live in Redis. Give each bot, friend or service its own key, RPS budget and expiry. Revoke in one command.
+- **Per-key auth and rate limits.** Give each bot, friend or service its own key, RPS budget and expiry. Keys live in your config file (zero dependencies) or in Redis when you run several routers that must share limits.
 - **Method blocklist and routing.** Keep `getProgramAccounts` off the shared endpoint, or pin DAS calls to the one provider that supports them.
 - **WebSockets too.** Subscriptions go through the same auth and backend selection.
 - **Observability built in.** Prometheus metrics, a Grafana dashboard, a `/health` endpoint with per-backend slot and latency, and `x-rpc-backend` / `x-request-id` headers on every response.
@@ -36,13 +36,23 @@ docker compose exec router rpc-admin create my-bot --rate-limit 100
 
 Point your bot at `http://localhost:28899/?api-key=<the key it printed>`. Grafana is on <http://localhost:3000> (admin / admin) with the dashboard pre-provisioned.
 
-### From source
+### Single binary, no Redis
+
+Put keys straight in the config and leave `redis_url` empty:
+
+```toml
+[[api_keys]]
+key = "a-long-random-string"
+owner = "my-bot"
+rate_limit = 100
+```
 
 ```bash
 cargo build --release
-./target/release/sol-rpc-router --config config.toml      # needs Redis running
-./target/release/rpc-admin create my-bot --rate-limit 100
+./target/release/sol-rpc-router --config config.toml
 ```
+
+Edit the key list and send `SIGHUP` to apply it without a restart. Rate limits are enforced in-process, so this mode is for one router instance.
 
 Tagged releases publish pre-built binaries (Linux and macOS, x86_64 and arm64) and a multi-arch container image at `ghcr.io/roborun-xyz/sol-rpc-router`; see the [releases page](https://github.com/roborun-xyz/sol-rpc-router/releases).
 
@@ -80,7 +90,7 @@ Every response carries:
 | `x-rpc-attempts` | How many backends were tried (normal) or how many had replied when the winner was picked (fan-out) |
 | `x-request-id` | Generated per request, or echoed if you sent one. Also forwarded upstream. |
 
-Router credentials (`?api-key=`, `x-api-key`, `authorization`) are stripped before the request is forwarded. Backend URLs may carry their own `?api-key=` for the provider; the router merges them correctly.
+Router credentials (`?api-key=`, `x-api-key`, `authorization`) are stripped before the request is forwarded, and upstream `set-cookie` headers are dropped on the way back. Backend URLs may carry their own `?api-key=` for the provider; the router merges them correctly and never prints the query string in logs or errors.
 
 ## How a request flows
 
@@ -144,6 +154,7 @@ max_retries = 2                        # extra backends to try on failure
 fanout_methods = ["sendTransaction"]
 blocked_methods = ["getProgramAccounts"]
 shutdown_grace_secs = 10               # drain time after SIGTERM
+max_ws_connections_per_key = 100       # concurrent WebSocket sessions per key, 0 = unlimited
 
 [health_check]
 interval_secs = 30
@@ -169,12 +180,16 @@ Edit the file, then send `SIGHUP` (`./reload.sh` does this). Backends, weights, 
 | Variable | Effect |
 |---|---|
 | `RPC_ROUTER_CONFIG` | Config path (same as `--config`) |
-| `REDIS_URL` | Overrides `redis_url` from the file |
+| `REDIS_URL` | Overrides `redis_url` from the file (selects the Redis keystore) |
 | `RUST_LOG` | Log level, e.g. `info` or `sol_rpc_router=debug` |
 
 ## API keys
 
-Keys are hashes in Redis (`api_key:<key>`) with `owner`, `rate_limit`, `active`, `created_at` and optional `expires_at`. The router caches lookups for 60 s, so revocations and limit changes take up to a minute to apply. Rate limits are per-second counters enforced atomically in Redis, so they hold across multiple router instances sharing one Redis.
+Two keystores; the config picks one.
+
+**Config file** (`redis_url` empty, `[[api_keys]]` present): each entry has `key`, `owner`, optional `rate_limit` (req/s, `0` = unlimited), `expires_at` (unix seconds, `0` = never) and `active`. Changes apply on `SIGHUP`. Limits are per-second windows kept in memory, so they are per router instance. No `rpc-admin` needed.
+
+**Redis** (`redis_url` set): keys are hashes (`api_key:<key>`) with `owner`, `rate_limit`, `active`, `created_at` and optional `expires_at`, managed with `rpc-admin`. The router caches lookups for 60 s, so revocations and limit changes take up to a minute to apply. Rate limits are per-second counters enforced atomically in Redis, so they hold across multiple router instances sharing one Redis.
 
 ```bash
 rpc-admin create alice --rate-limit 50                 # 50 req/s, never expires
@@ -200,7 +215,7 @@ rpc-admin delete <key>                                  # gone
 | `/health` | GET | no | Backend status JSON; 200 if any backend is healthy, else 503 |
 | `:metrics_port/metrics` | GET | no | Prometheus metrics |
 
-Router-generated errors are JSON-RPC shaped and keep your request `id`:
+Router-generated errors are JSON-RPC shaped and keep your request `id` when the body has been parsed (authentication happens before the body is read, so 401/429 carry `id: null`):
 
 ```json
 {"jsonrpc":"2.0","error":{"code":-32005,"message":"Rate limit exceeded"},"id":1}
@@ -208,8 +223,8 @@ Router-generated errors are JSON-RPC shaped and keep your request `id`:
 
 | HTTP | code | When |
 |---|---|---|
-| 401 | -32001 | Missing, unknown, revoked or expired key |
-| 429 | -32005 | Key over its per-second limit (`Retry-After: 1`) |
+| 401 | -32001 | Missing, unknown, revoked, expired or over-long key |
+| 429 | -32005 | Key over its per-second limit (`Retry-After: 1`), or over `max_ws_connections_per_key` |
 | 403 | -32601 | Method is in `blocked_methods` |
 | 413 | -32600 | Body over 10 MB |
 | 503 | -32010 | No healthy backend |
@@ -265,7 +280,8 @@ Request logs are one line per request with method, status, duration, backend, ow
 
 - The router speaks plain HTTP. Terminate TLS in front of it (Caddy, nginx, a cloud load balancer).
 - Expose `port` (and `port+1` if you want the dedicated WS listener). Keep `metrics_port` and Redis private.
-- Run as many router instances as you like against one Redis; rate limits stay consistent.
+- Run as many router instances as you like against one Redis; rate limits stay consistent. With the file keystore each instance limits independently.
+- Authentication runs before the request body is read, bodies are capped at 10 MB with a 10 s read timeout, key lookups are cached in a bounded cache, and WebSocket sessions are capped per key.
 - `SIGTERM` stops accepting connections, drains in-flight requests for `shutdown_grace_secs`, then exits. Long-lived WebSocket sessions are cut at the deadline.
 - CPU needs are small: with the benchmark process pinned to one tokio worker thread (router, mock upstream and load generator all sharing it) it still does about 38k req/s.
 
@@ -305,7 +321,8 @@ src/
   upstream.rs    upstream URI/header construction, retry classification
   rpc.rs         JSON-RPC probing, error bodies, known-method list
   health.rs      health check loop with slot-lag consensus
-  keystore.rs    Redis-backed API keys + rate limiting
+  keystore.rs    KeyStore trait, FileKeyStore (config keys, in-memory limits), RedisKeyStore
+  router.rs      router assembly shared by the binary, benchmark and tests
   mock.rs        in-memory KeyStore for tests
   bin/           rpc-admin, benchmark
 tests/           integration tests (mock backends bind to 127.0.0.1:0)
