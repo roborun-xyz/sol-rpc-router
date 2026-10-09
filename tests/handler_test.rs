@@ -1,5 +1,5 @@
-use std::{collections::HashMap, sync::Arc};
 use std::sync::atomic::AtomicBool;
+use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -319,9 +319,15 @@ async fn test_health_endpoint_all_healthy() {
 async fn test_health_endpoint_mixed() {
     let state = make_health_state(&test_backends());
 
-    let mut unhealthy = BackendHealthStatus::default();
-    unhealthy.healthy = false;
-    state.state.load().health_state.update_status("b", unhealthy);
+    let unhealthy = BackendHealthStatus {
+        healthy: false,
+        ..Default::default()
+    };
+    state
+        .state
+        .load()
+        .health_state
+        .update_status("b", unhealthy);
 
     let app = Router::new()
         .route("/health", get(health_endpoint))
@@ -349,8 +355,10 @@ async fn test_health_endpoint_all_unhealthy() {
     let state = make_health_state(&test_backends());
     let loaded = state.state.load();
     for label in &["a", "b"] {
-        let mut unhealthy = BackendHealthStatus::default();
-        unhealthy.healthy = false;
+        let unhealthy = BackendHealthStatus {
+            healthy: false,
+            ..Default::default()
+        };
         loaded.health_state.update_status(label, unhealthy);
     }
 

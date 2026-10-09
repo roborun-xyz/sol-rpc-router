@@ -143,7 +143,11 @@ weight = 0
     );
     let err = load_config(&path).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("weight 0"), "Expected 'weight 0' in error: {}", msg);
+    assert!(
+        msg.contains("weight 0"),
+        "Expected 'weight 0' in error: {}",
+        msg
+    );
     assert!(
         msg.contains("bad-backend"),
         "Expected backend name in error: {}",
@@ -268,7 +272,8 @@ weight = 1
     );
     let err = load_config(&path).unwrap_err();
     assert!(
-        err.to_string().contains("HTTP port and Metrics port must be different"),
+        err.to_string()
+            .contains("HTTP port and Metrics port must be different"),
         "Expected conflict error: {}",
         err
     );

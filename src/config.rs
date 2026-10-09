@@ -115,7 +115,11 @@ pub fn load_config(config_path: &str) -> Result<Config, Box<dyn std::error::Erro
     // Check for WebSocket port conflict (port + 1)
     let ws_port = config.port.checked_add(1).ok_or("Port overflow")?;
     if ws_port == config.metrics_port {
-        return Err(format!("Metrics port {} conflicts with WebSocket port (HTTP port + 1)", config.metrics_port).into());
+        return Err(format!(
+            "Metrics port {} conflicts with WebSocket port (HTTP port + 1)",
+            config.metrics_port
+        )
+        .into());
     }
 
     Ok(config)

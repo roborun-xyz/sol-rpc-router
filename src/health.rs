@@ -195,21 +195,18 @@ pub async fn health_check_loop(
             let backend = &current_state.backends[i];
 
             // Get current status from the detailed state
-            let mut current_status = health_state
-                .get_status(&label)
-                .unwrap_or_default();
+            let mut current_status = health_state.get_status(&label).unwrap_or_default();
 
             let previous_healthy = current_status.healthy;
 
             match check_result {
                 Ok(slot_opt) => {
                     // Check for slot lag against consensus
-                    let lagging = match (slot_opt, max_slot) {
-                        (Some(slot), Some(max)) if max > slot && (max - slot) > health_config.max_slot_lag => {
-                            true
-                        }
-                        _ => false,
-                    };
+                    let lagging = matches!(
+                        (slot_opt, max_slot),
+                        (Some(slot), Some(max))
+                            if max > slot && (max - slot) > health_config.max_slot_lag
+                    );
 
                     if lagging {
                         let slot = slot_opt.unwrap();

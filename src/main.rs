@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, sync::{atomic::AtomicBool, Arc}};
+use std::{
+    net::SocketAddr,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -38,7 +41,9 @@ async fn main() {
     // Using set_buckets makes the exporter emit true Prometheus histograms (_bucket/_sum/_count)
     // instead of summaries, which is required for histogram_quantile() in Grafana.
     let builder = PrometheusBuilder::new()
-        .set_buckets(&[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+        .set_buckets(&[
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ])
         .expect("failed to set histogram buckets");
     let handle = builder
         .install_recorder()
@@ -117,31 +122,30 @@ async fn main() {
     tokio::spawn(async move {
         info!("Starting health check loop");
         // Loop will read config from state each iteration
-        health_check_loop(
-            health_check_client,
-            health_check_state,
-        )
-        .await;
+        health_check_loop(health_check_client, health_check_state).await;
     });
 
     // Spawn SIGHUP handler for hot reload
     let reload_state = router_state.clone();
     let config_path = args.config.clone();
     // We keep the original health_state to preserve history across reloads if backends match
-    let persistent_health_state = health_state.clone(); 
+    let persistent_health_state = health_state.clone();
 
     tokio::spawn(async move {
         let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
-        
+
         loop {
             sighup.recv().await;
-            info!("Received SIGHUP, reloading configuration from {}", config_path);
+            info!(
+                "Received SIGHUP, reloading configuration from {}",
+                config_path
+            );
 
             match load_config(&config_path) {
                 Ok(new_config) => {
                     info!("Configuration reloaded successfully");
                     info!("New backend count: {}", new_config.backends.len());
-                    
+
                     // Re-initialize runtime backends
                     // We attempt to preserve health status if backend label matches
                     let new_runtime_backends: Vec<RuntimeBackend> = new_config
@@ -149,7 +153,9 @@ async fn main() {
                         .iter()
                         .map(|b| {
                             // Check if we have existing status for this label
-                            let is_healthy = if let Some(status) = persistent_health_state.get_status(&b.label) {
+                            let is_healthy = if let Some(status) =
+                                persistent_health_state.get_status(&b.label)
+                            {
                                 status.healthy
                             } else {
                                 true // Default new backends to healthy
@@ -161,13 +167,13 @@ async fn main() {
                             }
                         })
                         .collect();
-                    
+
                     // Update method routes info
                     if !new_config.method_routes.is_empty() {
-                         info!("Updated method routing overrides:");
-                         for (method, label) in &new_config.method_routes {
-                             info!("  - {} -> {}", method, label);
-                         }
+                        info!("Updated method routing overrides:");
+                        for (method, label) in &new_config.method_routes {
+                            info!("  - {} -> {}", method, label);
+                        }
                     }
 
                     // Create new router state
@@ -209,8 +215,8 @@ async fn main() {
         .layer(CorsLayer::permissive());
 
     // Metrics server (dedicated port)
-    let metrics_app = Router::new()
-        .route("/metrics", get(move || std::future::ready(handle.render())));
+    let metrics_app =
+        Router::new().route("/metrics", get(move || std::future::ready(handle.render())));
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let ws_port = config

@@ -151,16 +151,20 @@ pub async fn proxy(
     };
 
     let owner = match state.keystore.validate_key(&api_key).await {
-        Ok(Some(info)) => {
-            info.owner
-        }
+        Ok(Some(info)) => info.owner,
         Ok(None) => {
-            info!("Invalid API key presented (prefix={}...)", &api_key[..api_key.len().min(6)]);
+            info!(
+                "Invalid API key presented (prefix={}...)",
+                &api_key[..api_key.len().min(6)]
+            );
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
         Err(e) => {
             if e == "Rate limit exceeded" {
-                warn!("API key rate limited (prefix={}...)", &api_key[..api_key.len().min(6)]);
+                warn!(
+                    "API key rate limited (prefix={}...)",
+                    &api_key[..api_key.len().min(6)]
+                );
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
             } else {
                 error!("Key validation error: {}", e);
@@ -363,11 +367,13 @@ pub async fn ws_proxy(
 
     // Validate API key
     let owner = match state.keystore.validate_key(&api_key).await {
-        Ok(Some(info)) => {
-            info.owner
-        }
+        Ok(Some(info)) => info.owner,
         Ok(None) => {
-            info!("WebSocket: Invalid API key from {} (prefix={}...)", addr, &api_key[..api_key.len().min(6)]);
+            info!(
+                "WebSocket: Invalid API key from {} (prefix={}...)",
+                addr,
+                &api_key[..api_key.len().min(6)]
+            );
             counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => "auth_failed").increment(1);
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
@@ -375,7 +381,8 @@ pub async fn ws_proxy(
             if e == "Rate limit exceeded" {
                 warn!(
                     "WebSocket: API key rate limited from {} (prefix={}...)",
-                    addr, &api_key[..api_key.len().min(6)]
+                    addr,
+                    &api_key[..api_key.len().min(6)]
                 );
                 counter!("ws_connections_total", "backend" => "none", "owner" => "none", "status" => "rate_limited").increment(1);
                 return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
@@ -435,7 +442,8 @@ async fn handle_ws_connection(
     };
 
     counter!("ws_connections_total", "backend" => backend_label.clone(), "owner" => owner.clone(), "status" => "connected").increment(1);
-    gauge!("ws_active_connections", "backend" => backend_label.clone(), "owner" => owner.clone()).increment(1.0);
+    gauge!("ws_active_connections", "backend" => backend_label.clone(), "owner" => owner.clone())
+        .increment(1.0);
     let connect_time = std::time::Instant::now();
 
     info!(
@@ -546,7 +554,8 @@ async fn handle_ws_connection(
     }
 
     let duration = connect_time.elapsed().as_secs_f64();
-    gauge!("ws_active_connections", "backend" => backend_label.clone(), "owner" => owner.clone()).decrement(1.0);
+    gauge!("ws_active_connections", "backend" => backend_label.clone(), "owner" => owner.clone())
+        .decrement(1.0);
     histogram!("ws_connection_duration_seconds", "backend" => backend_label.clone(), "owner" => owner.clone()).record(duration);
 
     info!(

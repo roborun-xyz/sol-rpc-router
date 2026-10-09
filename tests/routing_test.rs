@@ -1,5 +1,5 @@
-use std::{collections::HashMap, sync::Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
 use hyper_tls::HttpsConnector;
@@ -16,7 +16,7 @@ fn create_test_state() -> AppState {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
 
-    let backend_configs = vec![
+    let backend_configs = [
         Backend {
             label: "primary".to_string(),
             url: "http://primary".to_string(),
@@ -187,8 +187,10 @@ fn test_select_backend_unhealthy_fallback() {
     loaded.backends[0].healthy.store(false, Ordering::Relaxed);
 
     // Also update health_state for consistency
-    let mut status = BackendHealthStatus::default();
-    status.healthy = false;
+    let status = BackendHealthStatus {
+        healthy: false,
+        ..Default::default()
+    };
     loaded.health_state.update_status("primary", status);
 
     let (label, _) = state.select_backend(None).unwrap();
@@ -213,7 +215,7 @@ fn create_ws_test_state() -> AppState {
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
 
-    let backend_configs = vec![
+    let backend_configs = [
         Backend {
             label: "ws-a".to_string(),
             url: "http://ws-a".to_string(),

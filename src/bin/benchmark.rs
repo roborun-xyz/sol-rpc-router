@@ -221,11 +221,7 @@ async fn main() {
         latencies.iter().sum::<u64>() as f64 / latencies.len() as f64 / 1000.0
     };
 
-    let p50 = latencies
-        .get(latencies.len() / 2)
-        .copied()
-        .unwrap_or(0) as f64
-        / 1000.0;
+    let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or(0) as f64 / 1000.0;
 
     let p99_idx = ((latencies.len() as f64) * 0.99) as usize;
     let p99 = latencies.get(p99_idx).copied().unwrap_or(0) as f64 / 1000.0;
