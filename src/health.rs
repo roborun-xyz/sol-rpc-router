@@ -7,14 +7,12 @@ use std::{
 use arc_swap::ArcSwap;
 use axum::{body::Body, http::Request};
 use futures_util::future;
-use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use metrics::{gauge, histogram};
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::{
     config::{Backend, HealthCheckConfig},
-    state::RouterState,
+    state::{HttpClient, RouterState},
 };
 
 #[derive(Debug, Clone)]
@@ -90,8 +88,8 @@ impl HealthState {
 /// Performs a health check against a backend.
 /// Returns `Ok(Some(slot))` if the method is `getSlot` or `getBlockHeight` and the response
 /// contains a numeric result. Returns `Ok(None)` for other methods. Returns `Err` on failure.
-async fn perform_health_check(
-    client: &Client<HttpsConnector<HttpConnector>, Body>,
+pub async fn perform_health_check(
+    client: &HttpClient,
     backend: &Backend,
     health_config: &HealthCheckConfig,
 ) -> Result<Option<u64>, String> {
@@ -160,10 +158,73 @@ async fn perform_health_check(
     }
 }
 
-pub async fn health_check_loop(
-    client: Client<HttpsConnector<HttpConnector>, Body>,
-    router_state: Arc<ArcSwap<RouterState>>,
-) {
+/// What one probe meant for a backend.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Healthy,
+    Lagging { slot: u64, max: u64 },
+    Failed(String),
+}
+
+/// Applies one probe result to a backend's status: counts consecutive
+/// successes/failures, flips `healthy` at the configured thresholds, and
+/// treats "more than `max_slot_lag` behind the best backend" as a failure.
+pub fn apply_probe(
+    status: &mut BackendHealthStatus,
+    result: Result<Option<u64>, String>,
+    max_slot: Option<u64>,
+    cfg: &HealthCheckConfig,
+) -> ProbeOutcome {
+    let outcome = match result {
+        Ok(slot_opt) => {
+            if let Some(slot) = slot_opt {
+                status.slot = Some(slot);
+            }
+            match (slot_opt, max_slot) {
+                (Some(slot), Some(max)) if max > slot && (max - slot) > cfg.max_slot_lag => {
+                    ProbeOutcome::Lagging { slot, max }
+                }
+                _ => ProbeOutcome::Healthy,
+            }
+        }
+        Err(e) => ProbeOutcome::Failed(e),
+    };
+
+    match &outcome {
+        ProbeOutcome::Healthy => {
+            status.consecutive_successes += 1;
+            status.consecutive_failures = 0;
+            status.last_error = None;
+            if status.consecutive_successes >= cfg.consecutive_successes_threshold {
+                status.healthy = true;
+            }
+        }
+        ProbeOutcome::Lagging { slot, max } => {
+            status.consecutive_failures += 1;
+            status.consecutive_successes = 0;
+            status.last_error = Some(format!(
+                "Backend lagging: slot {} is {} behind max {}",
+                slot,
+                max - slot,
+                max
+            ));
+            if status.consecutive_failures >= cfg.consecutive_failures_threshold {
+                status.healthy = false;
+            }
+        }
+        ProbeOutcome::Failed(e) => {
+            status.consecutive_failures += 1;
+            status.consecutive_successes = 0;
+            status.last_error = Some(e.clone());
+            if status.consecutive_failures >= cfg.consecutive_failures_threshold {
+                status.healthy = false;
+            }
+        }
+    }
+    outcome
+}
+
+pub async fn health_check_loop(client: HttpClient, router_state: Arc<ArcSwap<RouterState>>) {
     loop {
         // Load the current state for this iteration
         let current_state = router_state.load();
@@ -211,89 +272,34 @@ pub async fn health_check_loop(
             let previous_healthy = current_status.healthy;
 
             current_status.latency_ms = Some(latency_ms);
-
-            match check_result {
-                Ok(slot_opt) => {
-                    if let Some(slot) = slot_opt {
-                        current_status.slot = Some(slot);
-                        gauge!("rpc_backend_slot", "backend" => label.clone()).set(slot as f64);
-                        if let Some(max) = max_slot {
-                            gauge!("rpc_backend_slot_lag", "backend" => label.clone())
-                                .set(max.saturating_sub(slot) as f64);
-                        }
-                    }
-
-                    // Check for slot lag against consensus
-                    let lagging = matches!(
-                        (slot_opt, max_slot),
-                        (Some(slot), Some(max))
-                            if max > slot && (max - slot) > health_config.max_slot_lag
-                    );
-
-                    if lagging {
-                        let slot = slot_opt.unwrap();
-                        let max = max_slot.unwrap();
-                        current_status.consecutive_failures += 1;
-                        current_status.consecutive_successes = 0;
-                        current_status.last_error = Some(format!(
-                            "Backend lagging: slot {} is {} behind max {}",
-                            slot,
-                            max - slot,
-                            max
-                        ));
-
-                        if current_status.consecutive_failures
-                            >= health_config.consecutive_failures_threshold
-                        {
-                            current_status.healthy = false;
-                        }
-
-                        tracing::warn!(
-                            "Backend {} is lagging: slot {} is {} behind consensus max {} (threshold: {})",
-                            label,
-                            slot,
-                            max - slot,
-                            max,
-                            health_config.max_slot_lag
-                        );
-                    } else {
-                        current_status.consecutive_successes += 1;
-                        current_status.consecutive_failures = 0;
-                        current_status.last_error = None;
-
-                        // Mark healthy if threshold reached
-                        if current_status.consecutive_successes
-                            >= health_config.consecutive_successes_threshold
-                        {
-                            current_status.healthy = true;
-                        }
-
-                        tracing::debug!(
-                            "Health check succeeded for backend {} (consecutive successes: {})",
-                            label,
-                            current_status.consecutive_successes
-                        );
-                    }
+            if let Ok(Some(slot)) = &check_result {
+                gauge!("rpc_backend_slot", "backend" => label.clone()).set(*slot as f64);
+                if let Some(max) = max_slot {
+                    gauge!("rpc_backend_slot_lag", "backend" => label.clone())
+                        .set(max.saturating_sub(*slot) as f64);
                 }
-                Err(error) => {
-                    current_status.consecutive_failures += 1;
-                    current_status.consecutive_successes = 0;
-                    current_status.last_error = Some(error.clone());
+            }
 
-                    // Mark unhealthy if threshold reached
-                    if current_status.consecutive_failures
-                        >= health_config.consecutive_failures_threshold
-                    {
-                        current_status.healthy = false;
-                    }
-
-                    tracing::warn!(
-                        "Health check failed for backend {} (consecutive failures: {}): {}",
-                        label,
-                        current_status.consecutive_failures,
-                        error
-                    );
-                }
+            match apply_probe(&mut current_status, check_result, max_slot, health_config) {
+                ProbeOutcome::Healthy => tracing::debug!(
+                    "Health check succeeded for backend {} (consecutive successes: {})",
+                    label,
+                    current_status.consecutive_successes
+                ),
+                ProbeOutcome::Lagging { slot, max } => tracing::warn!(
+                    "Backend {} is lagging: slot {} is {} behind consensus max {} (threshold: {})",
+                    label,
+                    slot,
+                    max - slot,
+                    max,
+                    health_config.max_slot_lag
+                ),
+                ProbeOutcome::Failed(error) => tracing::warn!(
+                    "Health check failed for backend {} (consecutive failures: {}): {}",
+                    label,
+                    current_status.consecutive_failures,
+                    error
+                ),
             }
 
             current_status.last_check_time = Some(SystemTime::now());
@@ -330,5 +336,69 @@ pub async fn health_check_loop(
         drop(current_state);
 
         sleep(check_interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> HealthCheckConfig {
+        HealthCheckConfig {
+            consecutive_failures_threshold: 2,
+            consecutive_successes_threshold: 2,
+            max_slot_lag: 50,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failures_flip_unhealthy_at_threshold_and_successes_recover() {
+        let mut st = BackendHealthStatus::default();
+        assert!(st.healthy);
+        apply_probe(&mut st, Err("boom".into()), None, &cfg());
+        assert!(st.healthy, "one failure is below threshold");
+        apply_probe(&mut st, Err("boom".into()), None, &cfg());
+        assert!(!st.healthy);
+        assert_eq!(st.last_error.as_deref(), Some("boom"));
+
+        apply_probe(&mut st, Ok(Some(100)), Some(100), &cfg());
+        assert!(!st.healthy, "one success is below threshold");
+        apply_probe(&mut st, Ok(Some(101)), Some(101), &cfg());
+        assert!(st.healthy);
+        assert_eq!(st.slot, Some(101));
+        assert!(st.last_error.is_none());
+    }
+
+    #[test]
+    fn lag_beyond_threshold_counts_as_failure() {
+        let mut st = BackendHealthStatus::default();
+        let out = apply_probe(&mut st, Ok(Some(1000)), Some(1060), &cfg());
+        assert_eq!(
+            out,
+            ProbeOutcome::Lagging {
+                slot: 1000,
+                max: 1060
+            }
+        );
+        assert_eq!(st.consecutive_failures, 1);
+        assert!(st.last_error.unwrap().contains("60 behind"));
+
+        // Exactly at the threshold is fine.
+        let mut st = BackendHealthStatus::default();
+        assert_eq!(
+            apply_probe(&mut st, Ok(Some(1000)), Some(1050), &cfg()),
+            ProbeOutcome::Healthy
+        );
+        // The best backend itself is never lagging.
+        assert_eq!(
+            apply_probe(&mut st, Ok(Some(1050)), Some(1050), &cfg()),
+            ProbeOutcome::Healthy
+        );
+        // Methods that return no slot can't lag.
+        assert_eq!(
+            apply_probe(&mut st, Ok(None), Some(1050), &cfg()),
+            ProbeOutcome::Healthy
+        );
     }
 }

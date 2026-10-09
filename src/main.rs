@@ -46,7 +46,13 @@ async fn main() {
         .expect("failed to install Prometheus recorder");
 
     let args = Args::parse();
-    let config = load_config(&args.config).expect("Failed to load router configuration");
+    let config = match load_config(&args.config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to load {}: {}", args.config, e);
+            std::process::exit(1);
+        }
+    };
 
     info!(
         "sol-rpc-router v{} loaded configuration from {}",
@@ -142,6 +148,8 @@ async fn main() {
         let health_state = health_state.clone();
         let config_path = args.config.clone();
         let file_keystore = file_keystore.clone();
+        let (boot_port, boot_metrics_port, boot_redis) =
+            (config.port, config.metrics_port, config.redis_url.clone());
         tokio::spawn(async move {
             let mut sighup =
                 signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
@@ -153,6 +161,14 @@ async fn main() {
                 );
                 match load_config(&config_path) {
                     Ok(new_config) => {
+                        if new_config.port != boot_port
+                            || new_config.metrics_port != boot_metrics_port
+                            || new_config.redis_url != boot_redis
+                        {
+                            warn!(
+                                "port, metrics_port and redis_url changed in the file but only apply after a restart"
+                            );
+                        }
                         let new_state =
                             RouterState::from_config(&new_config, health_state.clone(), |label| {
                                 health_state

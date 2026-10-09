@@ -5,7 +5,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redis::AsyncCommands;
-use sol_rpc_router::keystore::{KeyStore, RedisKeyStore, KEY_PREFIX, RATE_LIMIT_PREFIX};
+use sol_rpc_router::keystore::{
+    KeyStore, KeyStoreError, RedisKeyStore, KEY_PREFIX, RATE_LIMIT_PREFIX,
+};
 
 fn redis_url() -> Option<String> {
     std::env::var("TEST_REDIS_URL")
@@ -66,7 +68,7 @@ async fn redis_keystore_end_to_end() {
     }
     assert_eq!(
         store.validate_key(&limited).await.unwrap_err(),
-        "Rate limit exceeded"
+        KeyStoreError::RateLimited
     );
     // The counter window is one second.
     tokio::time::sleep(Duration::from_millis(1100)).await;

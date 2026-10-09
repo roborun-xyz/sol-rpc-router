@@ -20,8 +20,8 @@ You have a Helius key, a Triton key, a QuickNode key and the public RPC. Your bo
 - **Per-key auth and rate limits.** Give each bot, friend or service its own key, RPS budget and expiry. Keys live in your config file (zero dependencies) or in Redis when you run several routers that must share limits.
 - **Method blocklist and routing.** Keep `getProgramAccounts` off the shared endpoint, or pin DAS calls to the one provider that supports them.
 - **WebSockets too.** Subscriptions go through the same auth and backend selection.
-- **Observability built in.** Prometheus metrics, a Grafana dashboard, a `/health` endpoint with per-backend slot and latency, and `x-rpc-backend` / `x-request-id` headers on every response.
-- **Fast.** About 77k req/s in-process at p99 1.3 ms on an Apple M3 Pro laptop (see [Benchmark](#benchmark)). The router will not be your bottleneck.
+- **Observability built in.** Prometheus metrics, a Grafana dashboard, a `/health` endpoint with per-backend slot and latency, `x-request-id` on every response and `x-rpc-backend` on every proxied one.
+- **Fast.** About 79k req/s in-process at p99 1.8 ms on an Apple M3 Pro laptop, full middleware stack included (see [Benchmark](#benchmark)). The router will not be your bottleneck.
 
 ## Quick start
 
@@ -82,7 +82,7 @@ const connection = new Connection("http://localhost:28899/?api-key=KEY", {
 });
 ```
 
-Every response carries:
+Every proxied response carries:
 
 | Header | Meaning |
 |---|---|
@@ -96,18 +96,18 @@ Router credentials (`?api-key=`, `x-api-key`, `authorization`) are stripped befo
 
 ```mermaid
 flowchart LR
-    C[Client] --> A{API key valid\nand under limit?}
-    A -- no --> E401[401 / 429\nJSON-RPC error]
-    A -- yes --> B{Method\nblocked?}
+    C[Client] --> A{API key valid<br/>and under limit?}
+    A -- no --> E401[401 / 429<br/>JSON-RPC error]
+    A -- yes --> B{Method<br/>blocked?}
     B -- yes --> E403[403]
-    B -- no --> F{Fan-out\nmethod?}
-    F -- yes --> FO[Send to every healthy backend\nfirst success wins]
-    F -- no --> S[Pick backend:\nmethod route, else weighted random\namong healthy]
+    B -- no --> F{Fan-out<br/>method?}
+    F -- yes --> FO[Send to every healthy backend<br/>first success wins]
+    F -- no --> S[Pick backend:<br/>method route, else weighted random<br/>among healthy]
     S --> U[Upstream request]
     U -- 2xx / 4xx --> R[Pass through]
-    U -- connect error, timeout,\n408, 429, 5xx --> RT{Retries\nleft?}
+    U -- connect error, timeout,<br/>408, 429, 5xx --> RT{Retries<br/>left?}
     RT -- yes --> S
-    RT -- no --> E502[502 / 504\nor last upstream status]
+    RT -- no --> E502[502 / 504<br/>or last upstream status]
 ```
 
 ### Failover rules
@@ -124,7 +124,7 @@ flowchart LR
 
 For methods listed in `proxy.fanout_methods` (typically `["sendTransaction"]`), the request is sent to every healthy backend concurrently. The first response that is HTTP 2xx *and* has no JSON-RPC `error` member is returned. If nobody succeeds, the first upstream error body (e.g. `Blockhash not found`) is surfaced so you can act on it. The other sends are not cancelled when a winner is picked, so every backend still gets the transaction.
 
-Fan-out multiplies your upstream request count by the number of healthy backends. It is opt-in.
+Fan-out multiplies your upstream request count by the number of healthy backends. It is opt-in. With only one healthy backend the call is sent normally (no fan-out, no `rpc_fanout_total` sample). Fan-out requests are sent without `accept-encoding` so the router can inspect the replies.
 
 ### Health checks
 
@@ -169,11 +169,11 @@ getAsset = "helius"
 searchAssets = "helius"
 ```
 
-See [`config.example.toml`](config.example.toml) for the annotated version. Validation rejects empty or duplicate labels, zero weights, non-`http(s)` / `ws(s)` URLs, routes to unknown labels, port collisions, and methods that are both fanned out and blocked.
+See [`config.example.toml`](config.example.toml) for the annotated version. Validation rejects unknown fields, empty or duplicate labels, zero weights, zero timeouts or thresholds, non-`http(s)` / `ws(s)` URLs, routes to unknown labels, port collisions, methods that are both fanned out and blocked, and ambiguous keystore settings.
 
 ### Hot reload
 
-Edit the file, then send `SIGHUP` (`./reload.sh` does this). Backends, weights, routes, fan-out and blocked lists, timeouts and health-check settings are swapped atomically; in-flight requests finish on the old state. Backends that keep their label keep their health history. The listen ports and Redis URL need a restart.
+Edit the file, then send `SIGHUP` (`./reload.sh`, or `docker compose kill -s HUP router`). Backends, weights, routes, fan-out and blocked lists, proxy timeouts, health-check settings and `[[api_keys]]` are swapped atomically; in-flight requests finish on the old state. Backends that keep their label keep their health history. `port`, `metrics_port`, `redis_url` and `shutdown_grace_secs` need a restart; the router logs a warning if they changed in the file. Unknown keys anywhere in the file are rejected at load time, so typos cannot silently disable a setting.
 
 ### Environment
 
@@ -193,11 +193,11 @@ Two keystores; the config picks one.
 
 ```bash
 rpc-admin create alice --rate-limit 50                 # 50 req/s, never expires
-rpc-admin create trial --rate-limit 10 --expires-in 7d # relative expiry (s, m, h, d, w)
+rpc-admin create trial --rate-limit 10 --expires-in 7d # relative expiry (s, m, h, d, w); or --expires-at <unix>
 rpc-admin create ci --rate-limit 0 --key my-fixed-key  # 0 = unlimited; custom key value
 rpc-admin list [--owner alice]
 rpc-admin inspect <key>                                 # includes requests used this second
-rpc-admin update <key> --rate-limit 100 --active false --expires-in 30d
+rpc-admin update <key> --rate-limit 100 --owner bob --active false --expires-in 30d   # or --expires-at <unix>, 0 clears
 rpc-admin revoke <key>                                  # keeps metadata, stops working
 rpc-admin delete <key>                                  # gone
 ```
@@ -215,21 +215,24 @@ rpc-admin delete <key>                                  # gone
 | `/health` | GET | no | Backend status JSON; 200 if any backend is healthy, else 503 |
 | `:metrics_port/metrics` | GET | no | Prometheus metrics |
 
-Router-generated errors are JSON-RPC shaped and keep your request `id` when the body has been parsed (authentication happens before the body is read, so 401/429 carry `id: null`):
+Router-generated errors are JSON-RPC shaped and keep your request `id` when the body has been parsed (authentication happens before the body is read, so 401/429/500 carry `id: null`). Router codes live in `-32090..-32099`, outside the `-32001..-32016` range Solana nodes use for their own errors, so clients never mistake a router condition for a node condition:
 
 ```json
-{"jsonrpc":"2.0","error":{"code":-32005,"message":"Rate limit exceeded"},"id":1}
+{"jsonrpc":"2.0","error":{"code":-32091,"message":"Rate limit exceeded"},"id":null}
 ```
 
 | HTTP | code | When |
 |---|---|---|
-| 401 | -32001 | Missing, unknown, revoked, expired or over-long key |
-| 429 | -32005 | Key over its per-second limit (`Retry-After: 1`), or over `max_ws_connections_per_key` |
-| 403 | -32601 | Method is in `blocked_methods` |
-| 413 | -32600 | Body over 10 MB |
-| 503 | -32010 | No healthy backend |
-| 502 | -32011 | All attempts failed with transport errors |
-| 504 | -32012 | All attempts timed out |
+| 401 | -32090 | Missing, unknown, revoked, expired or over-long key |
+| 429 | -32091 | Key over its per-second limit (`Retry-After: 1`), or over `max_ws_connections_per_key` |
+| 403 | -32092 | Method is in `blocked_methods` |
+| 503 | -32093 | No healthy backend |
+| 502 | -32094 | All attempts failed with transport errors |
+| 504 | -32095 | All attempts timed out |
+| 408 / 413 | -32600 | Body took over 10 s to arrive / exceeds 10 MB |
+| 500 | -32603 | Keystore failure (for example Redis down) |
+
+Upstream responses, including upstream JSON-RPC errors, pass through unchanged.
 
 ## Observability
 
@@ -247,7 +250,7 @@ Router-generated errors are JSON-RPC shaped and keep your request `id` when the 
       "consecutive_failures": 0, "consecutive_successes": 2, "last_error": null },
     { "label": "dead", "healthy": false, "slot": null, "latency_ms": 0,
       "last_check_unix": 1791523681, "last_check_age_secs": 1,
-      "consecutive_failures": 2, "consecutive_successes": 0,
+      "consecutive_failures": 3, "consecutive_successes": 0,
       "last_error": "Health check request failed: client error (Connect)" }
   ]
 }
@@ -279,26 +282,27 @@ Request logs are one line per request with method, status, duration, backend, ow
 ## Deployment notes
 
 - The router speaks plain HTTP. Terminate TLS in front of it (Caddy, nginx, a cloud load balancer).
+- The container `HEALTHCHECK` probes port 28899; override it if you change `port`. `/health` requests are excluded from request logs and metrics.
 - Expose `port` (and `port+1` if you want the dedicated WS listener). Keep `metrics_port` and Redis private.
 - Run as many router instances as you like against one Redis; rate limits stay consistent. With the file keystore each instance limits independently.
 - Authentication runs before the request body is read, bodies are capped at 10 MB with a 10 s read timeout, key lookups are cached in a bounded cache, and WebSocket sessions are capped per key.
 - `SIGTERM` stops accepting connections, drains in-flight requests for `shutdown_grace_secs`, then exits. Long-lived WebSocket sessions are cut at the deadline.
-- CPU needs are small: with the benchmark process pinned to one tokio worker thread (router, mock upstream and load generator all sharing it) it still does about 38k req/s.
+- CPU needs are small: with the benchmark process pinned to one tokio worker thread (router, mock upstream and load generator all sharing it) it still does about 28k req/s.
 
 ## Benchmark
 
-`cargo run --release --bin benchmark` starts a mock upstream and the router in one process and floods it, so the number is the router's own overhead with no network or Redis in the loop.
+`cargo run --release --bin benchmark -- -c 64 -d 10` starts a mock upstream and the router (the same router assembly the binary uses, middleware included) in one process and floods it, so the number is the router's own overhead with no network or Redis in the loop.
 
 ```
 Concurrency:     64
-Total Requests:  769606   (10 s)
-RPS:             76952
-P50 Latency:     0.81ms
-P99 Latency:     1.32ms
-P99.9 Latency:   1.71ms
+Total Requests:  792166   (10 s)
+RPS:             79216
+P50 Latency:     0.77ms
+P99 Latency:     1.82ms
+P99.9 Latency:   4.39ms
 ```
 
-Apple M3 Pro (11 cores), release profile with LTO, measured 2026-10-08. Same run with `TOKIO_WORKER_THREADS=1`: 38k req/s, p99 1.0 ms.
+Apple M3 Pro (11 cores), release profile with LTO, measured 2026-10-08. Same run with `TOKIO_WORKER_THREADS=1`: 28k req/s, p99 3.2 ms.
 
 ## Development
 

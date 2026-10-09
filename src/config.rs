@@ -6,6 +6,7 @@ use serde::Deserialize;
 pub const REDIS_URL_ENV: &str = "REDIS_URL";
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub port: u16,
     pub metrics_port: u16,
@@ -28,7 +29,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Per-attempt upstream timeout.
     pub timeout_secs: u64,
@@ -64,7 +65,7 @@ impl Default for ProxyConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HealthCheckConfig {
     pub interval_secs: u64,
     pub timeout_secs: u64,
@@ -88,6 +89,7 @@ impl Default for HealthCheckConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ApiKeyConfig {
     pub key: String,
     pub owner: String,
@@ -123,6 +125,7 @@ impl Config {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Backend {
     pub label: String,
     pub url: String,
@@ -230,6 +233,17 @@ pub fn validate_config(
 
     if config.proxy.timeout_secs == 0 {
         return Err("Proxy timeout_secs must be > 0".into());
+    }
+    if config.health_check.interval_secs == 0 {
+        return Err("health_check.interval_secs must be > 0".into());
+    }
+    if config.health_check.timeout_secs == 0 {
+        return Err("health_check.timeout_secs must be > 0".into());
+    }
+    if config.health_check.consecutive_failures_threshold == 0
+        || config.health_check.consecutive_successes_threshold == 0
+    {
+        return Err("health_check thresholds must be > 0".into());
     }
 
     for method in &config.proxy.fanout_methods {

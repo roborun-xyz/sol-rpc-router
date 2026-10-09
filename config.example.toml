@@ -47,5 +47,7 @@ consecutive_successes_threshold = 2    # successes before it is put back
 max_slot_lag = 50                      # slots behind the best backend before it counts as failing
 
 # Pin specific methods to a backend (falls back to weighted selection if it is unhealthy).
+# Typical use: DAS methods only one provider supports.
 [method_routes]
-getProgramAccounts = "helius"
+getAsset = "helius"
+searchAssets = "helius"

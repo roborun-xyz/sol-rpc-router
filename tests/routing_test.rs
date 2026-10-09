@@ -96,7 +96,7 @@ fn test_select_backend_weighted() {
     let mut secondary_count = 0;
 
     for _ in 0..iterations {
-        let (label, _) = state.select_backend(None).unwrap();
+        let label = state.state.load().select_backend(None, &[]).unwrap().label;
         if label == "primary" {
             primary_count += 1;
         } else {
@@ -142,7 +142,7 @@ fn test_select_backend_method_override() {
     ]));
 
     let mut method_routes = HashMap::new();
-    method_routes.insert("eth_call".to_string(), "secondary".to_string());
+    method_routes.insert("getAsset".to_string(), "secondary".to_string());
 
     let router_state = RouterState {
         method_routes,
@@ -155,10 +155,20 @@ fn test_select_backend_method_override() {
         Arc::new(ArcSwap::from_pointee(router_state)),
     );
 
-    let (label, _) = state.select_backend(Some("eth_call")).unwrap();
+    let label = state
+        .state
+        .load()
+        .select_backend(Some("getAsset"), &[])
+        .unwrap()
+        .label;
     assert_eq!(label, "secondary");
 
-    let (label, _) = state.select_backend(Some("eth_blockNumber")).unwrap();
+    let label = state
+        .state
+        .load()
+        .select_backend(Some("getSlot"), &[])
+        .unwrap()
+        .label;
     // With weight 0 for secondary, it should be primary
     assert_eq!(label, "primary");
 }
@@ -178,7 +188,7 @@ fn test_select_backend_unhealthy_fallback() {
     };
     loaded.health_state.update_status("primary", status);
 
-    let (label, _) = state.select_backend(None).unwrap();
+    let label = state.state.load().select_backend(None, &[]).unwrap().label;
     assert_eq!(label, "secondary");
 }
 
@@ -190,7 +200,7 @@ fn test_select_backend_all_unhealthy() {
         backend.healthy.store(false, Ordering::Relaxed);
     }
 
-    assert!(state.select_backend(None).is_none());
+    assert!(state.state.load().select_backend(None, &[]).is_none());
 }
 
 // --- WebSocket backend selection tests ---
@@ -242,7 +252,8 @@ fn test_select_ws_backend_weighted() {
     let mut b_count = 0;
 
     for _ in 0..1000 {
-        let (label, url) = state.select_ws_backend().unwrap();
+        let sel = state.state.load().select_ws_backend().unwrap();
+        let (label, url) = (sel.label, sel.url);
         assert!(url.starts_with("ws://"));
         if label == "ws-a" {
             a_count += 1;
@@ -258,7 +269,7 @@ fn test_select_ws_backend_weighted() {
 #[test]
 fn test_select_ws_backend_no_ws_urls() {
     let state = create_test_state(); // backends have no ws_url
-    assert!(state.select_ws_backend().is_none());
+    assert!(state.state.load().select_ws_backend().is_none());
 }
 
 #[test]
@@ -270,7 +281,20 @@ fn test_select_ws_backend_unhealthy_excluded() {
     loaded.backends[0].healthy.store(false, Ordering::Relaxed);
 
     for _ in 0..100 {
-        let (label, _) = state.select_ws_backend().unwrap();
+        let label = state.state.load().select_ws_backend().unwrap().label;
         assert_eq!(label, "ws-b");
     }
+}
+
+#[test]
+fn test_select_backend_excludes_tried_labels() {
+    let state = create_test_state();
+    let rs = state.state.load();
+    // "primary" has weight 100, "secondary" weight 0; excluding primary must
+    // still yield secondary (weighted pick degrades to first candidate).
+    let sel = rs.select_backend(None, &["primary".to_string()]).unwrap();
+    assert_eq!(sel.label, "secondary");
+    assert!(rs
+        .select_backend(None, &["primary".to_string(), "secondary".to_string()])
+        .is_none());
 }

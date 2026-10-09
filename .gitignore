@@ -1,9 +1,8 @@
 # Rust
 /target/
 
-# Environment variables (contains secrets)
+# Local router config (contains provider keys)
 config.toml
-debug_config.toml
 
 # IDE
 .vscode/

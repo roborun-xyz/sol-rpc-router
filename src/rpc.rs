@@ -8,17 +8,21 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// JSON-RPC error codes used by the router itself. Negative numbers in the
-/// -32000..-32099 range are reserved for implementation-defined server errors.
+/// JSON-RPC error codes used by the router itself.
+///
+/// Solana nodes use -32001..-32016 for their own custom errors (node
+/// unhealthy, preflight failure, block cleaned up, ...), so router errors
+/// live in -32090..-32099 where no Solana client will misread them.
+/// `INVALID_REQUEST` and `INTERNAL` are the standard JSON-RPC codes.
 pub mod codes {
-    pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_REQUEST: i64 = -32600;
-    pub const UNAUTHORIZED: i64 = -32001;
-    pub const RATE_LIMITED: i64 = -32005;
-    pub const NO_BACKEND: i64 = -32010;
-    pub const UPSTREAM_ERROR: i64 = -32011;
-    pub const UPSTREAM_TIMEOUT: i64 = -32012;
     pub const INTERNAL: i64 = -32603;
+    pub const UNAUTHORIZED: i64 = -32090;
+    pub const RATE_LIMITED: i64 = -32091;
+    pub const METHOD_BLOCKED: i64 = -32092;
+    pub const NO_BACKEND: i64 = -32093;
+    pub const UPSTREAM_ERROR: i64 = -32094;
+    pub const UPSTREAM_TIMEOUT: i64 = -32095;
 }
 
 /// Label used for batch (array) JSON-RPC requests in logs and metrics.

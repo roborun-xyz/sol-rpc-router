@@ -38,6 +38,7 @@ ENV RUST_LOG=info \
     RPC_ROUTER_CONFIG=/app/config.toml
 
 EXPOSE 28899 28900 28901
+# Assumes the default `port = 28899`; override HEALTHCHECK if you change it.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -fsS http://127.0.0.1:28899/health >/dev/null || exit 1
 

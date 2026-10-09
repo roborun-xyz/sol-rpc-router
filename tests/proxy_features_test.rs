@@ -101,7 +101,6 @@ fn backend(label: &str, url: &str, weight: u32) -> RuntimeBackend {
 
 struct TestApp {
     router: Router,
-    #[allow(dead_code)]
     keystore: Arc<MockKeyStore>,
 }
 
@@ -202,7 +201,7 @@ async fn auth_failure_returns_jsonrpc_error_without_reading_body() {
     assert_eq!(json["jsonrpc"], "2.0");
     // Auth runs before the body is read, so the id is not known yet.
     assert!(json["id"].is_null());
-    assert_eq!(json["error"]["code"], -32001);
+    assert_eq!(json["error"]["code"], -32090);
 }
 
 #[tokio::test]
@@ -223,7 +222,7 @@ async fn rate_limited_returns_retry_after() {
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
     let json = body_json(resp).await;
-    assert_eq!(json["error"]["code"], -32005);
+    assert_eq!(json["error"]["code"], -32091);
 }
 
 #[tokio::test]
@@ -368,7 +367,7 @@ async fn all_backends_dead_returns_502_jsonrpc_error() {
     // Only two backends exist, so only two attempts regardless of max_retries.
     assert_eq!(resp.headers().get(ATTEMPTS_HEADER).unwrap(), "2");
     let json = body_json(resp).await;
-    assert_eq!(json["error"]["code"], -32011);
+    assert_eq!(json["error"]["code"], -32094);
     assert_eq!(json["id"], 1);
 }
 
@@ -498,7 +497,7 @@ async fn blocked_method_is_rejected_before_upstream() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
-    assert_eq!(json["error"]["code"], -32601);
+    assert_eq!(json["error"]["code"], -32092);
     assert_eq!(b.hits.load(Ordering::SeqCst), 0);
 }
 
@@ -796,4 +795,108 @@ async fn file_keystore_end_to_end() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn upstream_timeout_returns_504_after_exhausting_backends() {
+    let slow: Handler = Arc::new(|_, _| {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        (StatusCode::OK, r#"{"result":1}"#.into())
+    });
+    let b = start_backend(slow).await;
+    let app = build_app(
+        vec![backend("slow", &b.url, 1)],
+        HashMap::new(),
+        ProxyConfig {
+            timeout_secs: 1,
+            max_retries: 3,
+            ..Default::default()
+        },
+    );
+    let resp = app
+        .router
+        .oneshot(rpc_request("/?api-key=test-key", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(resp.headers().get(ATTEMPTS_HEADER).unwrap(), "1");
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], -32095);
+    assert_eq!(json["id"], 1);
+}
+
+#[tokio::test]
+async fn fanout_does_not_ask_for_compressed_bodies() {
+    let strict: Handler = Arc::new(|headers, _| {
+        if headers.contains_key("accept-encoding") {
+            (StatusCode::IM_A_TEAPOT, "compressed?".into())
+        } else {
+            (
+                StatusCode::OK,
+                r#"{"jsonrpc":"2.0","result":"sig","id":1}"#.into(),
+            )
+        }
+    });
+    let b1 = start_backend(strict.clone()).await;
+    let b2 = start_backend(strict).await;
+    let cfg = ProxyConfig {
+        timeout_secs: 2,
+        fanout_methods: vec!["sendTransaction".into()],
+        ..Default::default()
+    };
+    let app = build_app(
+        vec![backend("b1", &b1.url, 1), backend("b2", &b2.url, 1)],
+        HashMap::new(),
+        cfg,
+    );
+    let mut req = rpc_request("/?api-key=test-key", "sendTransaction");
+    req.headers_mut()
+        .insert("accept-encoding", "gzip, br".parse().unwrap());
+    let resp = app.router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["result"], "sig");
+}
+
+#[tokio::test]
+async fn malformed_query_falls_back_to_header_auth() {
+    let b = start_backend(ok_backend()).await;
+    let app = build_app(vec![backend("b", &b.url, 1)], HashMap::new(), fast_proxy(0));
+
+    // Duplicate api-key params: not a 400, just "no key in the query".
+    let resp = app
+        .router
+        .clone()
+        .oneshot(rpc_request("/?api-key=a&api-key=b", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], -32090);
+
+    // ...and a header still authenticates.
+    let mut req = rpc_request("/?api-key=a&api-key=b", "getSlot");
+    req.headers_mut()
+        .insert("x-api-key", "test-key".parse().unwrap());
+    let resp = app.router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn health_probe_is_not_counted_or_proxied() {
+    let b = start_backend(ok_backend()).await;
+    let app = build_app(vec![backend("b", &b.url, 1)], HashMap::new(), fast_proxy(0));
+    let resp = app
+        .router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(b.hits.load(Ordering::SeqCst), 0);
 }

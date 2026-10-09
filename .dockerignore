@@ -1,7 +1,11 @@
 target/
 .git/
 .github/
+.claude/
 grafana/
+docker/
+tests/
 *.md
 config.toml
 docker-compose.yml
+reload.sh

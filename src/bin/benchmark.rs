@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -48,7 +48,7 @@ async fn start_mock_upstream() -> SocketAddr {
             post(|Json(_payload): Json<Value>| async {
                 Json(json!({
                     "jsonrpc": "2.0",
-                    "result": "0x1234567890abcdef",
+                    "result": 454772105,
                     "id": 1
                 }))
             }),
@@ -74,10 +74,7 @@ async fn start_router(upstream_addr: SocketAddr) -> SocketAddr {
         weight: 1,
     };
 
-    let runtime_backend = RuntimeBackend {
-        config: backend,
-        healthy: Arc::new(AtomicBool::new(true)),
-    };
+    let runtime_backend = RuntimeBackend::new(backend, true);
 
     let health_state = Arc::new(HealthState::new(vec!["mock-upstream".to_string()]));
 

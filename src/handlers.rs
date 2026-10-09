@@ -30,7 +30,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessag
 use tracing::{error, info, warn};
 
 use crate::{
-    keystore::MAX_KEY_LEN,
+    keystore::{KeyStoreError, MAX_KEY_LEN},
     rpc::{self, codes, RpcRequestInfo},
     state::{AppState, HttpClient, Selection},
     upstream,
@@ -44,6 +44,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Slow-body clients are cut off after this long.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+pub const HEALTH_PATH: &str = "/health";
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const BACKEND_HEADER: &str = "x-rpc-backend";
 pub const ATTEMPTS_HEADER: &str = "x-rpc-attempts";
@@ -182,24 +183,39 @@ pub async fn log_requests(
         .map(|a| a.0)
         .unwrap_or(1);
 
-    info!(
-        "{} {} {} status={} {:.1?} rpc_method={} backend={} owner={} attempts={} request_id={}",
-        method,
-        path,
-        addr,
-        response.status().as_u16(),
-        duration,
-        rpc_method,
-        backend,
-        owner,
-        attempts,
-        request_id
-    );
+    if path == HEALTH_PATH {
+        // Liveness probes every few seconds would drown real traffic.
+        tracing::debug!(
+            "{} {} {} status={} {:.1?}",
+            method,
+            path,
+            addr,
+            response.status().as_u16(),
+            duration
+        );
+    } else {
+        info!(
+            "{} {} {} status={} {:.1?} rpc_method={} backend={} owner={} attempts={} request_id={}",
+            method,
+            path,
+            addr,
+            response.status().as_u16(),
+            duration,
+            rpc_method,
+            backend,
+            owner,
+            attempts,
+            request_id
+        );
+    }
 
     response
 }
 
 pub async fn track_metrics(req: Request<Body>, next: Next) -> Response {
+    if req.uri().path() == HEALTH_PATH {
+        return next.run(req).await;
+    }
     let start = std::time::Instant::now();
     let method = req.method().to_string();
 
@@ -305,11 +321,11 @@ pub async fn authenticate(
             );
             Err(AuthFailure::Invalid)
         }
-        Err(e) if e == "Rate limit exceeded" => {
+        Err(KeyStoreError::RateLimited) => {
             warn!("API key rate limited (prefix={}...)", key_prefix(&api_key));
             Err(AuthFailure::RateLimited)
         }
-        Err(e) => {
+        Err(KeyStoreError::Backend(e)) => {
             error!("Key validation error: {}", e);
             Err(AuthFailure::Internal(e))
         }
@@ -360,10 +376,13 @@ impl AuthFailure {
 /// nothing beyond the key lookup.
 pub async fn require_api_key(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<Params>,
+    params: Option<Query<Params>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    // A malformed query string (duplicate api-key, bad percent-encoding) is
+    // treated as "no key in the query"; header auth still applies.
+    let params = params.map(|Query(p)| p).unwrap_or(Params { api_key: None });
     let is_ws = req
         .headers()
         .get(header::UPGRADE)
@@ -445,7 +464,7 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
             counter!("rpc_blocked_total", "rpc_method" => rpc::metric_label(blocked).to_string(), "owner" => owner.clone()).increment(1);
             let resp = rpc::error_response(
                 StatusCode::FORBIDDEN,
-                codes::METHOD_NOT_FOUND,
+                codes::METHOD_BLOCKED,
                 format!("Method '{}' is not available on this endpoint", blocked),
                 rpc_id,
             );
@@ -606,9 +625,9 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
 
 enum FanoutOutcome {
     /// 2xx with a JSON body that has no `error` member.
-    Good(StatusCode, Bytes),
+    Good(StatusCode, Option<HeaderValue>, Bytes),
     /// Anything else we got an HTTP response for.
-    Bad(StatusCode, Bytes),
+    Bad(StatusCode, Option<HeaderValue>, Bytes),
     Failed(String),
 }
 
@@ -636,7 +655,10 @@ async fn fanout(
                 continue;
             }
         };
-        let headers = upstream::forwardable_headers(client_headers, &uri);
+        let mut headers = upstream::forwardable_headers(client_headers, &uri);
+        // We must inspect the body to pick a winner, so ask for identity
+        // encoding; otherwise a gzip reply would look like a parse failure.
+        headers.remove(header::ACCEPT_ENCODING);
         let req = upstream::build_request(uri, &headers, body.clone());
         let client = client.clone();
         let tx = tx.clone();
@@ -647,6 +669,7 @@ async fn fanout(
             let outcome = match send_once(&client, req, timeout_secs).await {
                 Ok(resp) => {
                     let status = resp.status();
+                    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
                     let bytes = match http_body_util::Limited::new(
                         resp.into_body(),
                         MAX_FANOUT_RESPONSE_SIZE,
@@ -669,9 +692,9 @@ async fn fanout(
                         .map(|v| v.get("error").is_some())
                         .unwrap_or(true);
                     if status.is_success() && !is_rpc_error {
-                        FanoutOutcome::Good(status, bytes)
+                        FanoutOutcome::Good(status, content_type, bytes)
                     } else {
-                        FanoutOutcome::Bad(status, bytes)
+                        FanoutOutcome::Bad(status, content_type, bytes)
                     }
                 }
                 Err(AttemptError::Timeout) => {
@@ -685,30 +708,30 @@ async fn fanout(
     drop(tx);
 
     let method_label = rpc::metric_label(method).to_string();
-    let mut first_bad: Option<(String, StatusCode, Bytes)> = None;
+    let mut first_bad: Option<(String, StatusCode, Option<HeaderValue>, Bytes)> = None;
     let mut first_failure: Option<(String, String)> = None;
     let mut received = 0u32;
 
     while let Some((label, outcome)) = rx.recv().await {
         received += 1;
         match outcome {
-            FanoutOutcome::Good(status, bytes) => {
+            FanoutOutcome::Good(status, content_type, bytes) => {
                 counter!("rpc_fanout_total", "rpc_method" => method_label.clone(), "outcome" => "ok").increment(1);
                 info!(
                     "fanout {} answered by backend={} ({}/{} responses in)",
                     method, label, received, total
                 );
-                let resp = json_bytes_response(status, bytes);
+                let resp = bytes_response(status, content_type, bytes);
                 return tag_response(resp, &label, owner, received);
             }
-            FanoutOutcome::Bad(status, bytes) => {
+            FanoutOutcome::Bad(status, content_type, bytes) => {
                 warn!(
                     "fanout {} backend={} returned {} with an error body",
                     method,
                     label,
                     status.as_u16()
                 );
-                first_bad.get_or_insert((label, status, bytes));
+                first_bad.get_or_insert((label, status, content_type, bytes));
             }
             FanoutOutcome::Failed(msg) => {
                 warn!("fanout {} backend={} failed: {}", method, label, msg);
@@ -718,10 +741,15 @@ async fn fanout(
     }
 
     counter!("rpc_fanout_total", "rpc_method" => method_label, "outcome" => "failed").increment(1);
-    if let Some((label, status, bytes)) = first_bad {
+    if let Some((label, status, content_type, bytes)) = first_bad {
         // Surface the real upstream error (e.g. blockhash not found) rather
         // than hiding it behind a generic proxy message.
-        return tag_response(json_bytes_response(status, bytes), &label, owner, received);
+        return tag_response(
+            bytes_response(status, content_type, bytes),
+            &label,
+            owner,
+            received,
+        );
     }
     let (label, msg) = first_failure.unwrap_or_else(|| ("none".to_string(), "no backends".into()));
     let resp = rpc::error_response(
@@ -733,11 +761,11 @@ async fn fanout(
     tag_response(resp, &label, owner, received)
 }
 
-fn json_bytes_response(status: StatusCode, bytes: Bytes) -> Response {
+fn bytes_response(status: StatusCode, content_type: Option<HeaderValue>, bytes: Bytes) -> Response {
     let mut resp = (status, bytes).into_response();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
+        content_type.unwrap_or_else(|| HeaderValue::from_static("application/json")),
     );
     resp
 }
@@ -870,8 +898,8 @@ pub async fn ws_proxy(
         }
     };
 
-    let (backend_label, backend_ws_url) = match state.select_ws_backend() {
-        Some(selection) => selection,
+    let (backend_label, backend_ws_url) = match state.state.load().select_ws_backend() {
+        Some(s) => (s.label, s.url),
         None => {
             error!("No healthy WebSocket backends available");
             counter!("ws_connections_total", "backend" => "none", "owner" => owner.clone(), "status" => "no_backend").increment(1);

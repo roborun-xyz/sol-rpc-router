@@ -2,7 +2,7 @@
 name = "sol-rpc-router"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 description = "Solana JSON-RPC reverse proxy with API key auth, rate limiting, weighted load balancing, method-based routing, WebSocket proxying, health checking, and Prometheus metrics"
 license = "Apache-2.0"
 repository = "https://github.com/roborun-xyz/sol-rpc-router"
@@ -27,12 +27,12 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 moka = { version = "0.12", features = ["future"] }
-async-trait = "0.1.89"
+async-trait = "0.1"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 http-body-util = "0.1"
-bytes = "1.11.1"
-arc-swap = "1.8.1"
+bytes = "1"
+arc-swap = "1"
 tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]

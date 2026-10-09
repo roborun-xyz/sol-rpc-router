@@ -1,3 +1,4 @@
+use sol_rpc_router::keystore::KeyStoreError;
 use sol_rpc_router::{keystore::KeyStore, mock::MockKeyStore};
 
 #[tokio::test]
@@ -45,7 +46,7 @@ async fn test_validate_key_rate_limit() {
 
     let result = store.validate_key("limited-key").await;
     assert!(result.is_err());
-    assert_eq!(result.err().unwrap(), "Rate limit exceeded");
+    assert_eq!(result.err().unwrap(), KeyStoreError::RateLimited);
 }
 
 #[tokio::test]
@@ -68,5 +69,8 @@ async fn test_validate_key_custom_error() {
 
     let result = store.validate_key("err-key").await;
     assert!(result.is_err());
-    assert_eq!(result.err().unwrap(), "Redis connection failed");
+    assert_eq!(
+        result.err().unwrap(),
+        KeyStoreError::Backend("Redis connection failed".into())
+    );
 }

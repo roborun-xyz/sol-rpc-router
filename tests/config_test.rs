@@ -57,9 +57,11 @@ fn test_load_config_invalid_toml() {
 }
 
 #[test]
-fn test_load_config_empty_redis_url() {
-    let path = write_temp_config(
-        "empty_redis",
+fn test_validate_config_empty_redis_url_and_no_keys() {
+    use sol_rpc_router::config::{validate_config, Config};
+    // Goes through validate_config directly so a REDIS_URL in the test
+    // environment cannot mask the check.
+    let config: Config = toml::from_str(
         r#"
 port = 8080
 metrics_port = 9091
@@ -70,8 +72,9 @@ label = "b1"
 url = "http://localhost:9000"
 weight = 1
 "#,
-    );
-    let err = load_config(&path).unwrap_err();
+    )
+    .unwrap();
+    let err = validate_config(config, None).unwrap_err();
     assert!(
         err.to_string().contains("No keystore configured"),
         "Expected keystore error: {}",
@@ -544,6 +547,65 @@ fn test_api_keys_validation() {
             &format!(
                 "port = 8080\nmetrics_port = 9091\n\n[[backends]]\nlabel = \"b1\"\nurl = \"http://localhost:9000\"\nweight = 1\n\n{}",
                 block
+            ),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(err.to_string().contains(needle), "{}: {}", name, err);
+    }
+}
+
+#[test]
+fn test_unknown_fields_are_rejected() {
+    for (name, body) in [
+        ("top", "max_retry = 5\n"),
+        ("proxy", "[proxy]\nmax_retry = 5\n"),
+        ("health", "[health_check]\ninterval = 5\n"),
+        (
+            "backend",
+            "[[backends]]\nlabel = \"x\"\nurl = \"http://x\"\nweight = 1\nwss_url = \"wss://x\"\n",
+        ),
+    ] {
+        let path = write_temp_config(
+            &format!("unknown_{}", name),
+            &format!(
+                "port = 8080\nmetrics_port = 9091\nredis_url = \"redis://localhost\"\n\n[[backends]]\nlabel = \"b1\"\nurl = \"http://localhost:9000\"\nweight = 1\n\n{}",
+                body
+            ),
+        );
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "{}: {}",
+            name,
+            err
+        );
+    }
+}
+
+#[test]
+fn test_zero_health_check_timings_are_rejected() {
+    for (name, body, needle) in [
+        (
+            "interval",
+            "[health_check]\ninterval_secs = 0\n",
+            "interval_secs",
+        ),
+        (
+            "timeout",
+            "[health_check]\ntimeout_secs = 0\n",
+            "timeout_secs",
+        ),
+        (
+            "threshold",
+            "[health_check]\nconsecutive_failures_threshold = 0\n",
+            "thresholds",
+        ),
+    ] {
+        let path = write_temp_config(
+            &format!("zero_{}", name),
+            &format!(
+                "port = 8080\nmetrics_port = 9091\nredis_url = \"redis://localhost\"\n\n[[backends]]\nlabel = \"b1\"\nurl = \"http://localhost:9000\"\nweight = 1\n\n{}",
+                body
             ),
         );
         let err = load_config(&path).unwrap_err();

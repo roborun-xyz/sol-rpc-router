@@ -83,7 +83,7 @@ async fn test_proxy_handler_success() {
         .uri("/?api-key=test-key")
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"getSlot","params":[],"id":1}"#,
         ))
         .unwrap();
 
@@ -112,7 +112,7 @@ async fn test_proxy_handler_unauthorized() {
         .method("POST")
         .uri("/?api-key=wrong-key")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"jsonrpc":"2.0","method":"test","id":1}"#))
+        .body(Body::from(r#"{"jsonrpc":"2.0","method":"getSlot","id":1}"#))
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
@@ -141,7 +141,7 @@ async fn test_proxy_handler_rate_limited() {
         .method("POST")
         .uri("/?api-key=limit-key")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"jsonrpc":"2.0","method":"test","id":1}"#))
+        .body(Body::from(r#"{"jsonrpc":"2.0","method":"getSlot","id":1}"#))
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
@@ -165,7 +165,7 @@ async fn test_proxy_no_api_key() {
         .method("POST")
         .uri("/")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"jsonrpc":"2.0","method":"test","id":1}"#))
+        .body(Body::from(r#"{"jsonrpc":"2.0","method":"getSlot","id":1}"#))
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
@@ -189,7 +189,7 @@ async fn test_proxy_keystore_internal_error() {
         .method("POST")
         .uri("/?api-key=err-key")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"jsonrpc":"2.0","method":"test","id":1}"#))
+        .body(Body::from(r#"{"jsonrpc":"2.0","method":"getSlot","id":1}"#))
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
@@ -226,7 +226,7 @@ async fn test_proxy_no_healthy_backends() {
         .method("POST")
         .uri("/?api-key=test-key")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"jsonrpc":"2.0","method":"test","id":1}"#))
+        .body(Body::from(r#"{"jsonrpc":"2.0","method":"getSlot","id":1}"#))
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();

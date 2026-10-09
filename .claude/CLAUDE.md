@@ -68,14 +68,15 @@ tests/
 ## Key Patterns
 
 - **State**: `AppState` is shared via `Arc<AppState>`; `AppState.state` is an `Arc<ArcSwap<RouterState>>` so SIGHUP reloads swap atomically. Build `RouterState` with `from_config()` (prod) or `simple()` (tests/bench).
-- **KeyStore trait**: `async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String>`. `Ok(Some)` valid, `Ok(None)` invalid/inactive/expired, `Err("Rate limit exceeded")` or `Err(other)`.
+- **KeyStore trait**: `async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, KeyStoreError>`. `Ok(Some)` valid, `Ok(None)` invalid/inactive/expired, `Err(RateLimited)` or `Err(Backend(msg))`.
+- **Error codes**: router codes are `-32090..-32099` (`rpc::codes`); never use `-32001..-32016`, Solana nodes own that range.
 - **Auth**: `require_api_key` middleware runs BEFORE `extract_rpc_method`, so bodies are never buffered for unauthenticated requests; it stores `ClientOwner` in request extensions and handlers read it (no auth inside handlers). Key sources: `?api-key=`, `x-api-key`, `Authorization: Bearer`. `upstream::forwardable_headers()` strips them before forwarding. Auth errors carry `id: null`.
 - **Keystore selection**: `Config::keystore_kind()`; empty `redis_url` + `[[api_keys]]` = file store, otherwise Redis. Setting both is a config error. SIGHUP reloads file keys via `FileKeyStore::reload()`.
 - **Secrets in logs**: always pass backend URLs through `upstream::redact_url()` before logging; provider keys live in their query strings.
 - **Proxy flow**: auth → blocked check → fan-out (if method listed) → retry loop via `RouterState::select_backend(method, &tried)`. Retryable = transport error, timeout, 408/429/5xx. Non-retryable upstream statuses pass through untouched.
 - **Fan-out**: sends are `tokio::spawn`ed and results arrive over an mpsc channel, so dropping the receiver after the first success does not cancel the remaining sends.
 - **Errors**: router-generated errors go through `rpc::error_response()` (JSON-RPC body with the request id). Keep HTTP status codes stable; tests assert on them.
-- **Health**: `HealthState` (`RwLock<HashMap>`) is the detailed record and what `/health` reports; `RuntimeBackend.healthy` (`AtomicBool`) is the lock-free flag the data path reads. The health loop updates both. Backends default to healthy.
+- **Health**: probe decisions live in the pure `health::apply_probe()` (unit-tested); the loop only does I/O and logging. `HealthState` (`RwLock<HashMap>`) is the detailed record and what `/health` reports; `RuntimeBackend.healthy` (`AtomicBool`) is the lock-free flag the data path reads. The health loop updates both. Backends default to healthy.
 - **Metrics**: use `rpc::metric_label()` for any `rpc_method` label to keep cardinality bounded.
 - **Tests**: use `tower::ServiceExt::oneshot()` on routers; bind real listeners only when `ConnectInfo` or a WS client is needed.
 

@@ -30,8 +30,13 @@ All notable changes to this project are documented here. The format follows
 - Config validation for backend URL schemes and fan-out/blocked conflicts.
 
 ### Changed
-- Removed the unused `debug_config.toml` scratch config (it never referenced a required field and nothing used it).
-- All router-generated error bodies are JSON-RPC shaped and carry the request `id`; 429 responses include `Retry-After`.
+- Router error codes moved to `-32090..-32099` so they cannot be confused with Solana's own `-32001..-32016` custom errors; blocked methods use `-32092` instead of `-32601`.
+- All router-generated error bodies are JSON-RPC shaped and carry the request `id` once the body has been parsed; 429 responses include `Retry-After`.
+- Unknown config fields and zero health-check timings are rejected at load time.
+- Fan-out requests omit `accept-encoding` so compressed upstream replies are never misread as errors; fan-out responses keep the upstream `content-type`.
+- `/health` requests are excluded from request logs and metrics; the "routed backend unhealthy" fallback message is now `debug`.
+- Malformed `?api-key=` query strings fall back to header auth instead of a plain-text 400.
+- `KeyStore` returns a typed `KeyStoreError` instead of a string.
 - `rpc_method` metric label is bounded to known Solana methods (`other` otherwise) to prevent cardinality blow-up.
 - Backend URLs that carry their own query string are merged correctly with client sub-paths and query parameters.
 - Router credentials and hop-by-hop headers are stripped before forwarding upstream; `set-cookie` and hop-by-hop headers from upstream responses are stripped before reaching clients.
@@ -45,10 +50,12 @@ All notable changes to this project are documented here. The format follows
 - Request body reads time out after 10 s.
 
 ### Fixed
-- Repository links point at `roborun-xyz`, where the project now lives.
 - `expires_at` set by `rpc-admin` was stored but never enforced; expired keys are now rejected.
 - WebSocket backend connects are bounded by a 10 s timeout instead of hanging the upgrade.
 
-## [0.1.0]
+## [0.1.0] - 2026-02-17
 
 Initial release: API key auth, Redis rate limiting, weighted load balancing, method routing, WebSocket proxying, consensus health checks, Prometheus metrics, hot reload, Grafana dashboard.
+
+[0.2.0]: https://github.com/roborun-xyz/sol-rpc-router/releases/tag/v0.2.0
+[0.1.0]: https://github.com/roborun-xyz/sol-rpc-router/commit/61a1381

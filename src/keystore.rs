@@ -35,12 +35,31 @@ pub struct KeyInfo {
     pub rate_limit: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyStoreError {
+    /// The key is valid but its per-second budget is spent.
+    RateLimited,
+    /// The keystore itself failed (Redis down, protocol error, ...).
+    Backend(String),
+}
+
+impl std::fmt::Display for KeyStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyStoreError::RateLimited => write!(f, "rate limit exceeded"),
+            KeyStoreError::Backend(msg) => write!(f, "keystore error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for KeyStoreError {}
+
 #[async_trait]
 pub trait KeyStore: Send + Sync {
     /// `Ok(Some(info))` for a valid key, `Ok(None)` for unknown/inactive/
-    /// expired keys, `Err("Rate limit exceeded")` when the per-second budget
-    /// is spent, and `Err(other)` for infrastructure failures.
-    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String>;
+    /// expired keys, `Err(RateLimited)` when the per-second budget is spent,
+    /// and `Err(Backend(_))` for infrastructure failures.
+    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, KeyStoreError>;
 }
 
 /// INCR + EXPIRE in one atomic step; the SHA is computed once per process.
@@ -62,12 +81,12 @@ pub struct RedisKeyStore {
 }
 
 impl RedisKeyStore {
-    pub async fn new(redis_url: &str) -> Result<Self, String> {
-        let client = Client::open(redis_url).map_err(|e| e.to_string())?;
+    pub async fn new(redis_url: &str) -> Result<Self, KeyStoreError> {
+        let client = Client::open(redis_url).map_err(|e| KeyStoreError::Backend(e.to_string()))?;
         let conn = client
             .get_connection_manager()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| KeyStoreError::Backend(e.to_string()))?;
 
         let cache = Cache::builder()
             .time_to_live(KEY_CACHE_TTL)
@@ -77,7 +96,7 @@ impl RedisKeyStore {
         Ok(Self { conn, cache })
     }
 
-    async fn get_key_info(&self, key: &str) -> Result<Option<KeyInfo>, String> {
+    async fn get_key_info(&self, key: &str) -> Result<Option<KeyInfo>, KeyStoreError> {
         if let Some(info) = self.cache.get(key).await {
             return Ok(info);
         }
@@ -90,14 +109,14 @@ impl RedisKeyStore {
             .arg(&redis_key)
             .query_async(&mut conn)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| KeyStoreError::Backend(e.to_string()))?;
 
         let info = parse_key_fields(&fields, now_unix());
         self.cache.insert(key.to_string(), info.clone()).await;
         Ok(info)
     }
 
-    async fn check_rate_limit(&self, key: &str, limit: u64) -> Result<bool, String> {
+    async fn check_rate_limit(&self, key: &str, limit: u64) -> Result<bool, KeyStoreError> {
         if limit == 0 {
             return Ok(true);
         }
@@ -109,7 +128,7 @@ impl RedisKeyStore {
             .key(&redis_key)
             .invoke_async(&mut conn)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| KeyStoreError::Backend(e.to_string()))?;
 
         Ok(count <= limit)
     }
@@ -147,7 +166,7 @@ pub fn parse_key_fields(fields: &HashMap<String, String>, now: u64) -> Option<Ke
 
 #[async_trait]
 impl KeyStore for RedisKeyStore {
-    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String> {
+    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, KeyStoreError> {
         if key.is_empty() || key.len() > MAX_KEY_LEN {
             return Ok(None);
         }
@@ -157,7 +176,7 @@ impl KeyStore for RedisKeyStore {
         };
 
         if !self.check_rate_limit(key, info.rate_limit).await? {
-            return Err("Rate limit exceeded".to_string());
+            return Err(KeyStoreError::RateLimited);
         }
         Ok(Some(info))
     }
@@ -245,7 +264,7 @@ impl FileKeyStore {
         w.count <= limit
     }
 
-    fn validate_at(&self, key: &str, now: u64) -> Result<Option<KeyInfo>, String> {
+    fn validate_at(&self, key: &str, now: u64) -> Result<Option<KeyInfo>, KeyStoreError> {
         let keys = self.keys.load();
         let entry = match keys.get(key) {
             Some(e) => e,
@@ -255,7 +274,7 @@ impl FileKeyStore {
             return Ok(None);
         }
         if !self.check_rate_limit(key, entry.info.rate_limit, now) {
-            return Err("Rate limit exceeded".to_string());
+            return Err(KeyStoreError::RateLimited);
         }
         Ok(Some(entry.info.clone()))
     }
@@ -263,7 +282,7 @@ impl FileKeyStore {
 
 #[async_trait]
 impl KeyStore for FileKeyStore {
-    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String> {
+    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, KeyStoreError> {
         if key.is_empty() || key.len() > MAX_KEY_LEN {
             return Ok(None);
         }
@@ -306,7 +325,7 @@ mod file_tests {
         assert!(store.validate_at("k", 10).unwrap().is_some());
         assert_eq!(
             store.validate_at("k", 10).unwrap_err(),
-            "Rate limit exceeded"
+            KeyStoreError::RateLimited
         );
         // Next second resets.
         assert!(store.validate_at("k", 11).unwrap().is_some());

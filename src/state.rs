@@ -11,7 +11,7 @@ use axum::body::Body;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use rand::Rng;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
     config::{Backend, Config, HealthCheckConfig, ProxyConfig},
@@ -139,7 +139,7 @@ impl RouterState {
                             url: b.config.url.clone(),
                         });
                     }
-                    Some(_) => info!(
+                    Some(_) => debug!(
                         "Method {} target label={} unavailable, falling back to weighted selection",
                         method, target
                     ),
@@ -235,20 +235,6 @@ impl AppState {
             .get(owner)
             .copied()
             .unwrap_or(0)
-    }
-
-    pub fn select_backend(&self, rpc_method: Option<&str>) -> Option<(String, String)> {
-        self.state
-            .load()
-            .select_backend(rpc_method, &[])
-            .map(|s| (s.label, s.url))
-    }
-
-    pub fn select_ws_backend(&self) -> Option<(String, String)> {
-        self.state
-            .load()
-            .select_ws_backend()
-            .map(|s| (s.label, s.url))
     }
 }
 

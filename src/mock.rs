@@ -5,7 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 
-use crate::keystore::{KeyInfo, KeyStore};
+use crate::keystore::{KeyInfo, KeyStore, KeyStoreError};
 
 #[derive(Clone)]
 pub struct MockKeyStore {
@@ -61,14 +61,14 @@ impl MockKeyStore {
 
 #[async_trait]
 impl KeyStore for MockKeyStore {
-    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, String> {
+    async fn validate_key(&self, key: &str) -> Result<Option<KeyInfo>, KeyStoreError> {
         let mut counts = self.call_counts.lock().unwrap();
         *counts.entry(key.to_string()).or_insert(0) += 1;
         drop(counts);
 
         // Check for custom errors first
         if let Some(msg) = self.error_keys.lock().unwrap().get(key) {
-            return Err(msg.clone());
+            return Err(KeyStoreError::Backend(msg.clone()));
         }
 
         if self
@@ -87,7 +87,7 @@ impl KeyStore for MockKeyStore {
                 .unwrap()
                 .contains(&key.to_string())
             {
-                return Err("Rate limit exceeded".to_string());
+                return Err(KeyStoreError::RateLimited);
             }
 
             return Ok(Some(info.clone()));
