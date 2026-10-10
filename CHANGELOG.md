@@ -4,10 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] - 2026-10-08
+## [Unreleased]
 
 ### Added
 - Per-backend `max_rps`: a token-bucket budget per provider; backends out of budget are skipped (429 with `Retry-After` only when all are), so free-tier and paid providers can share a pool without upstream 429s.
+
+## [0.2.0] - 2026-10-08
+
+### Added
 - File-based keystore: list keys under `[[api_keys]]` and leave `redis_url` empty to run without Redis (single instance, in-process limits, SIGHUP reload).
 - `proxy.max_ws_connections_per_key` caps concurrent WebSocket sessions per key (default 100).
 - Automatic failover: transport errors, timeouts and HTTP 408/429/5xx are retried on another healthy backend (`proxy.max_retries`).
@@ -54,5 +58,6 @@ All notable changes to this project are documented here. The format follows
 
 Initial release: API key auth, Redis rate limiting, weighted load balancing, method routing, WebSocket proxying, consensus health checks, Prometheus metrics, hot reload, Grafana dashboard.
 
+[Unreleased]: https://github.com/roborun-xyz/sol-rpc-router/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/roborun-xyz/sol-rpc-router/releases/tag/v0.2.0
 [0.1.0]: https://github.com/roborun-xyz/sol-rpc-router/commit/61a1381
