@@ -10,6 +10,7 @@ You have a Helius key, a Triton key, a QuickNode key and the public RPC. Your bo
 `sol-rpc-router` is that layer:
 
 - **Automatic failover.** Connection errors, timeouts, 429s and 5xxs are retried on a different healthy backend. Clients see one response.
+- **Latency-aware routing (opt-in).** `selection = "latency_weighted"` scales each backend's weight by how its observed request latency compares to the fastest one, so slow providers quietly get less traffic without being cut off.
 - **Provider budgets.** Give each backend a `max_rps` and the router stops sending to it before the provider starts refusing. A free public endpoint can sit next to a paid plan without ever tripping its limit.
 - **`sendTransaction` fan-out.** Broadcast a transaction to every healthy backend at once and return the first success, so the transaction reaches every provider you have, not just the one the dice picked.
 - **Consensus-aware health checks.** A backend that falls more than N slots behind the best one is pulled from rotation until it catches up.
@@ -116,6 +117,13 @@ flowchart LR
 
 `proxy.max_retries` (default `2`) caps the extra backends tried. A backend is never tried twice for one request. Method routes are honoured on the first attempt only.
 
+### Selection strategies
+
+When no method route applies, a backend is picked at random among healthy backends with budget, in proportion to a weight:
+
+- `weighted` (default): the configured `weight`.
+- `latency_weighted`: `weight × (fastest_latency / own_latency)`, using an exponentially weighted moving average of real request latency through each backend (not probe latency). The fastest backend keeps its full weight; one twice as slow gets half; nothing drops below 5 % of its weight, so a slow provider keeps getting a trickle and can recover. Backends with no sample yet count as fastest so they get measured. `/health` shows the EWMA as `request_latency_ms`.
+
 ### Provider budgets
 
 A backend with `max_rps = N` gets a token bucket of N requests per second (one-second burst). Selection only considers healthy backends with a token left, so traffic shifts to the others before the metered provider sees a 429; its weight still applies among backends that have budget. Fan-out skips budget-less backends too. If every healthy backend is out of budget the client gets a 429 with `Retry-After: 1` rather than a request that would fail upstream. Budgets are per router instance.
@@ -156,6 +164,7 @@ fanout_methods = ["sendTransaction"]
 blocked_methods = ["getProgramAccounts"]
 shutdown_grace_secs = 10               # drain time after SIGTERM
 max_ws_connections_per_key = 100       # concurrent WebSocket sessions per key, 0 = unlimited
+selection = "weighted"                 # or "latency_weighted" (see Selection strategies)
 
 [health_check]
 interval_secs = 30
@@ -248,9 +257,11 @@ Upstream responses, including upstream JSON-RPC errors, pass through unchanged.
   "total_backends": 3,
   "backends": [
     { "label": "helius", "healthy": true, "slot": 454772124, "latency_ms": 43,
+      "request_latency_ms": 38.5, "has_capacity": true,
       "last_check_unix": 1791523681, "last_check_age_secs": 1,
       "consecutive_failures": 0, "consecutive_successes": 2, "last_error": null },
     { "label": "dead", "healthy": false, "slot": null, "latency_ms": 0,
+      "request_latency_ms": null, "has_capacity": true,
       "last_check_unix": 1791523681, "last_check_age_secs": 1,
       "consecutive_failures": 3, "consecutive_successes": 0,
       "last_error": "Health check request failed: client error (Connect)" }
@@ -273,6 +284,7 @@ Prometheus metrics (the `rpc_method` label is restricted to known Solana methods
 | `rpc_backend_slot` | gauge | `backend` |
 | `rpc_backend_slot_lag` | gauge | `backend` (slots behind the best backend) |
 | `rpc_backend_health_check_duration_seconds` | histogram | `backend` |
+| `rpc_backend_request_latency_ewma_seconds` | gauge | `backend` |
 | `ws_connections_total` | counter | `backend`, `owner`, `status` |
 | `ws_active_connections` | gauge | `backend`, `owner` |
 | `ws_messages_total` | counter | `backend`, `owner`, `direction` |

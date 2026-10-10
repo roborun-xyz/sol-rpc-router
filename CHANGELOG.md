@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `proxy.selection = "latency_weighted"`: opt-in strategy that scales each backend's weight by observed request latency (EWMA) relative to the fastest backend, with a 5 % floor. `/health` gains `request_latency_ms` and `has_capacity`; new gauge `rpc_backend_request_latency_ewma_seconds`.
 - Per-backend `max_rps`: a token-bucket budget per provider; backends out of budget are skipped (429 with `Retry-After` only when all are), so free-tier and paid providers can share a pool without upstream 429s.
 
 ## [0.2.0] - 2026-10-08

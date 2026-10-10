@@ -74,6 +74,7 @@ tests/
 - **Keystore selection**: `Config::keystore_kind()`; empty `redis_url` + `[[api_keys]]` = file store, otherwise Redis. Setting both is a config error. SIGHUP reloads file keys via `FileKeyStore::reload()`.
 - **Secrets in logs**: always pass backend URLs through `upstream::redact_url()` before logging; provider keys live in their query strings.
 - **Provider budgets**: `Backend.max_rps` → `RuntimeBackend.budget: Option<Arc<TokenBucket>>`. `select_backend` peeks capacity when filtering and consumes one token on the pick; `healthy_backends()` (fan-out) consumes one per backend returned. `None` from `select_backend` with `any_healthy()` true means "all at capacity" → 429/-32096, not 503.
+- **Selection strategy**: `proxy.selection` (`Weighted` | `LatencyWeighted`). `RuntimeBackend.latency_us` is an EWMA of real request latency fed by `RouterState::record_latency()` after every upstream attempt; `latency_scaled_weights()` turns it into weights. Unit-tested in state.rs.
 - **Proxy flow**: auth → blocked check → fan-out (if method listed) → retry loop via `RouterState::select_backend(method, &tried)`. Retryable = transport error, timeout, 408/429/5xx. Non-retryable upstream statuses pass through untouched.
 - **Fan-out**: sends are `tokio::spawn`ed and results arrive over an mpsc channel, so dropping the receiver after the first success does not cancel the remaining sends.
 - **Errors**: router-generated errors go through `rpc::error_response()` (JSON-RPC body with the request id). Keep HTTP status codes stable; tests assert on them.

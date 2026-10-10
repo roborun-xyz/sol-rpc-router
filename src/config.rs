@@ -49,6 +49,21 @@ pub struct ProxyConfig {
     pub shutdown_grace_secs: u64,
     /// Maximum concurrent WebSocket sessions per API key. `0` disables the cap.
     pub max_ws_connections_per_key: u32,
+    /// How a backend is chosen when no method route applies.
+    pub selection: SelectionStrategy,
+}
+
+/// Backend selection strategy among healthy backends with budget.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionStrategy {
+    /// Weighted random by configured `weight`.
+    #[default]
+    Weighted,
+    /// Weighted random where each weight is scaled by how the backend's
+    /// observed request latency compares to the fastest one, so slow
+    /// providers get proportionally less traffic without being cut off.
+    LatencyWeighted,
 }
 
 impl Default for ProxyConfig {
@@ -60,6 +75,7 @@ impl Default for ProxyConfig {
             blocked_methods: Vec::new(),
             shutdown_grace_secs: 10,
             max_ws_connections_per_key: 100,
+            selection: SelectionStrategy::Weighted,
         }
     }
 }

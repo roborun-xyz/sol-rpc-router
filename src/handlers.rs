@@ -540,7 +540,10 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
         tried.push(selection.label.clone());
 
         let has_more = attempt < max_attempts;
-        match send_once(&state.client, req, timeout_secs).await {
+        let started = std::time::Instant::now();
+        let result = send_once(&state.client, req, timeout_secs).await;
+        rs.record_latency(&selection.label, started.elapsed());
+        match result {
             Ok(resp) => {
                 let status = resp.status();
                 if upstream::is_retryable_status(status) && has_more {
@@ -799,7 +802,12 @@ pub struct BackendHealth {
     pub label: String,
     pub healthy: bool,
     pub slot: Option<u64>,
+    /// Round-trip of the last health probe.
     pub latency_ms: Option<u64>,
+    /// EWMA of real request latency through this backend, if any.
+    pub request_latency_ms: Option<f64>,
+    /// Upstream budget left this second, if `max_rps` is set.
+    pub has_capacity: bool,
     pub last_check_unix: Option<u64>,
     pub last_check_age_secs: Option<u64>,
     pub consecutive_failures: u32,
@@ -840,6 +848,10 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
             healthy,
             slot: status.slot,
             latency_ms: status.latency_ms,
+            request_latency_ms: backend
+                .latency()
+                .map(|d| (d.as_secs_f64() * 1000.0 * 10.0).round() / 10.0),
+            has_capacity: backend.has_capacity(),
             last_check_unix,
             last_check_age_secs,
             consecutive_failures: status.consecutive_failures,

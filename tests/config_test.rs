@@ -612,3 +612,62 @@ fn test_zero_health_check_timings_are_rejected() {
         assert!(err.to_string().contains(needle), "{}: {}", name, err);
     }
 }
+
+#[test]
+fn test_selection_strategy_parses() {
+    use sol_rpc_router::config::SelectionStrategy;
+    let path = write_temp_config(
+        "selection",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+
+[proxy]
+selection = "latency_weighted"
+"#,
+    );
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.proxy.selection, SelectionStrategy::LatencyWeighted);
+
+    let path = write_temp_config(
+        "selection_default",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#,
+    );
+    assert_eq!(
+        load_config(&path).unwrap().proxy.selection,
+        SelectionStrategy::Weighted
+    );
+
+    let path = write_temp_config(
+        "selection_bad",
+        r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+
+[proxy]
+selection = "fastest"
+"#,
+    );
+    assert!(load_config(&path).is_err());
+}

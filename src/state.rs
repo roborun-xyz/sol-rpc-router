@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use std::time::Instant;
@@ -16,7 +17,7 @@ use rand::Rng;
 use tracing::debug;
 
 use crate::{
-    config::{Backend, Config, HealthCheckConfig, ProxyConfig},
+    config::{Backend, Config, HealthCheckConfig, ProxyConfig, SelectionStrategy},
     health::HealthState,
     keystore::KeyStore,
 };
@@ -83,12 +84,21 @@ impl TokenBucket {
     }
 }
 
+/// Smoothing factor for the request-latency EWMA (0..1, higher = more reactive).
+const LATENCY_EWMA_ALPHA: f64 = 0.2;
+/// A slow backend never drops below this share of its configured weight, so
+/// it keeps receiving a trickle of traffic and can recover.
+const LATENCY_WEIGHT_FLOOR: f64 = 0.05;
+
 #[derive(Debug, Clone)]
 pub struct RuntimeBackend {
     pub config: Backend,
     pub healthy: Arc<AtomicBool>,
     /// Present when `max_rps > 0`.
     pub budget: Option<Arc<TokenBucket>>,
+    /// EWMA of observed upstream request latency in microseconds; 0 = no
+    /// sample yet.
+    pub latency_us: Arc<AtomicU64>,
 }
 
 impl RuntimeBackend {
@@ -98,6 +108,27 @@ impl RuntimeBackend {
             config,
             healthy: Arc::new(AtomicBool::new(healthy)),
             budget,
+            latency_us: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Folds one observed request duration into the latency EWMA.
+    pub fn record_latency(&self, d: Duration) {
+        let sample = d.as_micros().min(u64::MAX as u128) as u64;
+        let prev = self.latency_us.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            sample
+        } else {
+            (prev as f64 * (1.0 - LATENCY_EWMA_ALPHA) + sample as f64 * LATENCY_EWMA_ALPHA) as u64
+        };
+        self.latency_us.store(next.max(1), Ordering::Relaxed);
+    }
+
+    /// Observed request latency, if any sample has been recorded.
+    pub fn latency(&self) -> Option<Duration> {
+        match self.latency_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(Duration::from_micros(us)),
         }
     }
 
@@ -207,6 +238,13 @@ impl RouterState {
         self.backends.iter().any(|b| b.is_healthy())
     }
 
+    /// Records an observed upstream latency for the backend with `label`.
+    pub fn record_latency(&self, label: &str, d: Duration) {
+        if let Some(b) = self.backends.iter().find(|b| b.config.label == label) {
+            b.record_latency(d);
+        }
+    }
+
     /// Picks a backend for `rpc_method`, honouring method routes first and
     /// falling back to weighted random among healthy backends that still have
     /// upstream budget. Backends whose label is in `exclude` are skipped,
@@ -247,7 +285,7 @@ impl RouterState {
         // between peek and take) drop that candidate and pick again.
         let mut candidates: Vec<&RuntimeBackend> =
             self.backends.iter().filter(|b| allowed(b)).collect();
-        while let Some(b) = weighted_pick(&candidates) {
+        while let Some(b) = pick_with_strategy(&candidates, self.proxy.selection) {
             if b.take_capacity() {
                 return Some(Selection {
                     label: b.config.label.clone(),
@@ -271,6 +309,64 @@ impl RouterState {
             url: b.config.ws_url.clone().expect("filtered on ws_url"),
         })
     }
+}
+
+fn pick_with_strategy<'a>(
+    candidates: &[&'a RuntimeBackend],
+    strategy: SelectionStrategy,
+) -> Option<&'a RuntimeBackend> {
+    match strategy {
+        SelectionStrategy::Weighted => weighted_pick(candidates),
+        SelectionStrategy::LatencyWeighted => {
+            let weights = latency_scaled_weights(candidates);
+            weighted_pick_f64(candidates, &weights)
+        }
+    }
+}
+
+/// Scales each candidate's configured weight by `fastest / own` latency, so
+/// the fastest backend keeps its full weight and a backend twice as slow gets
+/// half, down to [`LATENCY_WEIGHT_FLOOR`]. Backends with no sample yet count
+/// as fastest so they get measured.
+pub fn latency_scaled_weights(candidates: &[&RuntimeBackend]) -> Vec<f64> {
+    let fastest = candidates
+        .iter()
+        .filter_map(|b| b.latency())
+        .map(|d| d.as_secs_f64())
+        .fold(f64::INFINITY, f64::min);
+    candidates
+        .iter()
+        .map(|b| {
+            let base = b.config.weight as f64;
+            match b.latency() {
+                Some(d) if fastest.is_finite() && d.as_secs_f64() > 0.0 => {
+                    base * (fastest / d.as_secs_f64()).clamp(LATENCY_WEIGHT_FLOOR, 1.0)
+                }
+                _ => base,
+            }
+        })
+        .collect()
+}
+
+fn weighted_pick_f64<'a>(
+    candidates: &[&'a RuntimeBackend],
+    weights: &[f64],
+) -> Option<&'a RuntimeBackend> {
+    let total: f64 = weights.iter().sum();
+    if candidates.is_empty() {
+        return None;
+    }
+    if total <= 0.0 {
+        return candidates.first().copied();
+    }
+    let mut roll = rand::thread_rng().gen_range(0.0..total);
+    for (b, w) in candidates.iter().zip(weights) {
+        if roll < *w {
+            return Some(b);
+        }
+        roll -= w;
+    }
+    candidates.last().copied()
 }
 
 /// Weighted random selection. Weights are validated > 0 at config load, but a
@@ -382,6 +478,86 @@ mod tests {
         assert!(b.try_acquire_at(t2));
         assert!(b.try_acquire_at(t2));
         assert!(!b.try_acquire_at(t2));
+    }
+
+    fn backend(label: &str, weight: u32) -> RuntimeBackend {
+        RuntimeBackend::new(
+            Backend {
+                label: label.into(),
+                url: format!("http://{}", label),
+                weight,
+                ws_url: None,
+                max_rps: 0,
+            },
+            true,
+        )
+    }
+
+    #[test]
+    fn latency_ewma_smooths_samples() {
+        let b = backend("a", 1);
+        assert!(b.latency().is_none());
+        b.record_latency(Duration::from_millis(100));
+        assert_eq!(b.latency().unwrap(), Duration::from_millis(100));
+        b.record_latency(Duration::from_millis(200));
+        // 100 * 0.8 + 200 * 0.2 = 120
+        assert_eq!(b.latency().unwrap(), Duration::from_millis(120));
+    }
+
+    #[test]
+    fn latency_scaled_weights_favour_fast_backends_with_a_floor() {
+        let fast = backend("fast", 10);
+        let slow = backend("slow", 10);
+        let glacial = backend("glacial", 10);
+        let fresh = backend("fresh", 10);
+        fast.record_latency(Duration::from_millis(10));
+        slow.record_latency(Duration::from_millis(40));
+        glacial.record_latency(Duration::from_secs(10));
+        let w = latency_scaled_weights(&[&fast, &slow, &glacial, &fresh]);
+        assert_eq!(w[0], 10.0, "fastest keeps full weight");
+        assert_eq!(w[1], 2.5, "4x slower gets a quarter");
+        assert_eq!(w[2], 0.5, "floor of 5%");
+        assert_eq!(w[3], 10.0, "unmeasured counts as fastest");
+    }
+
+    #[test]
+    fn latency_weighted_pick_skews_traffic() {
+        let fast = backend("fast", 1);
+        let slow = backend("slow", 1);
+        fast.record_latency(Duration::from_millis(10));
+        slow.record_latency(Duration::from_millis(1000));
+        let candidates = [&fast, &slow];
+        let mut fast_hits = 0;
+        for _ in 0..2000 {
+            if pick_with_strategy(&candidates, SelectionStrategy::LatencyWeighted)
+                .unwrap()
+                .config
+                .label
+                == "fast"
+            {
+                fast_hits += 1;
+            }
+        }
+        // Expected share 1 / 1.05 ≈ 95%; allow slack for randomness.
+        assert!(fast_hits > 1800, "fast got {} of 2000", fast_hits);
+        assert!(fast_hits < 2000, "slow must still get a trickle");
+
+        let mut fast_hits = 0;
+        for _ in 0..2000 {
+            if pick_with_strategy(&candidates, SelectionStrategy::Weighted)
+                .unwrap()
+                .config
+                .label
+                == "fast"
+            {
+                fast_hits += 1;
+            }
+        }
+        assert!(
+            (800..1200).contains(&fast_hits),
+            "plain weighted stays ~50/50, got {}",
+            fast_hits
+        );
     }
 
     #[test]

@@ -326,6 +326,11 @@ pub async fn health_check_loop(client: HttpClient, router_state: Arc<ArcSwap<Rou
             // Update detailed state (locked)
             health_state.update_status(&label, current_status.clone());
 
+            if let Some(d) = backend.latency() {
+                gauge!("rpc_backend_request_latency_ewma_seconds", "backend" => label.clone())
+                    .set(d.as_secs_f64());
+            }
+
             // Update atomic boolean (lock-free)
             backend
                 .healthy
