@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-10
 
 ### Added
 - `proxy.selection = "latency_weighted"`: opt-in strategy that scales each backend's weight by observed request latency (EWMA) relative to the fastest backend, with a 5 % floor. `/health` gains `request_latency_ms` and `has_capacity`; new gauge `rpc_backend_request_latency_ewma_seconds`.
@@ -59,6 +59,6 @@ All notable changes to this project are documented here. The format follows
 
 Initial release: API key auth, Redis rate limiting, weighted load balancing, method routing, WebSocket proxying, consensus health checks, Prometheus metrics, hot reload, Grafana dashboard.
 
-[Unreleased]: https://github.com/roborun-xyz/sol-rpc-router/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/roborun-xyz/sol-rpc-router/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/roborun-xyz/sol-rpc-router/releases/tag/v0.2.0
 [0.1.0]: https://github.com/roborun-xyz/sol-rpc-router/commit/61a1381

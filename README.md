@@ -252,7 +252,7 @@ Upstream responses, including upstream JSON-RPC errors, pass through unchanged.
 ```json
 {
   "overall_status": "healthy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "healthy_backends": 2,
   "total_backends": 3,
   "backends": [
