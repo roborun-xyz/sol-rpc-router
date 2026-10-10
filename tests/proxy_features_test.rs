@@ -93,6 +93,7 @@ fn backend(label: &str, url: &str, weight: u32) -> RuntimeBackend {
             label: label.to_string(),
             url: url.to_string(),
             ws_url: None,
+            max_rps: 0,
             weight,
         },
         true,
@@ -899,4 +900,43 @@ async fn health_probe_is_not_counted_or_proxied() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(b.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn max_rps_exhaustion_returns_429_with_retry_after() {
+    let b = start_backend(ok_backend()).await;
+    let metered = RuntimeBackend::new(
+        Backend {
+            label: "metered".to_string(),
+            url: b.url.clone(),
+            ws_url: None,
+            weight: 1,
+            max_rps: 1,
+        },
+        true,
+    );
+    let app = build_app(vec![metered], HashMap::new(), fast_proxy(2));
+
+    let first = app
+        .router
+        .clone()
+        .oneshot(rpc_request("/?api-key=test-key", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .router
+        .oneshot(rpc_request("/?api-key=test-key", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.headers().get("retry-after").unwrap(), "1");
+    let json = body_json(second).await;
+    assert_eq!(json["error"]["code"], -32096);
+    assert_eq!(
+        b.hits.load(Ordering::SeqCst),
+        1,
+        "no upstream call over budget"
+    );
 }

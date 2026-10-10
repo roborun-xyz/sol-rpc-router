@@ -10,6 +10,7 @@ You have a Helius key, a Triton key, a QuickNode key and the public RPC. Your bo
 `sol-rpc-router` is that layer:
 
 - **Automatic failover.** Connection errors, timeouts, 429s and 5xxs are retried on a different healthy backend. Clients see one response.
+- **Provider budgets.** Give each backend a `max_rps` and the router stops sending to it before the provider starts refusing. A free public endpoint can sit next to a paid plan without ever tripping its limit.
 - **`sendTransaction` fan-out.** Broadcast a transaction to every healthy backend at once and return the first success, so the transaction reaches every provider you have, not just the one the dice picked.
 - **Consensus-aware health checks.** A backend that falls more than N slots behind the best one is pulled from rotation until it catches up.
 - **Per-key auth and rate limits.** Give each bot, friend or service its own key, RPS budget and expiry. Keys live in your config file (zero dependencies) or in Redis when you run several routers that must share limits.
@@ -115,6 +116,10 @@ flowchart LR
 
 `proxy.max_retries` (default `2`) caps the extra backends tried. A backend is never tried twice for one request. Method routes are honoured on the first attempt only.
 
+### Provider budgets
+
+A backend with `max_rps = N` gets a token bucket of N requests per second (one-second burst). Selection only considers healthy backends with a token left, so traffic shifts to the others before the metered provider sees a 429; its weight still applies among backends that have budget. Fan-out skips budget-less backends too. If every healthy backend is out of budget the client gets a 429 with `Retry-After: 1` rather than a request that would fail upstream. Budgets are per router instance.
+
 ### Fan-out
 
 For methods listed in `proxy.fanout_methods` (typically `["sendTransaction"]`), the request is sent to every healthy backend concurrently. The first response that is HTTP 2xx *and* has no JSON-RPC `error` member is returned. If nobody succeeds, the first upstream error body (e.g. `Blockhash not found`) is surfaced so you can act on it. The other sends are not cancelled when a winner is picked, so every backend still gets the transaction.
@@ -142,6 +147,7 @@ weight = 10
 label = "public"
 url = "https://api.mainnet-beta.solana.com"
 weight = 1
+max_rps = 8                            # optional upstream budget (req/s); 0 or absent = unlimited
 
 [proxy]
 timeout_secs = 30                      # per attempt
@@ -224,6 +230,7 @@ Router-generated errors are JSON-RPC shaped and keep your request `id` when the 
 | 503 | -32093 | No healthy backend |
 | 502 | -32094 | All attempts failed with transport errors |
 | 504 | -32095 | All attempts timed out |
+| 429 | -32096 | Every healthy backend is out of `max_rps` budget (`Retry-After: 1`) |
 | 408 / 413 | -32600 | Body took over 10 s to arrive / exceeds 10 MB |
 | 500 | -32603 | Keystore failure (for example Redis down) |
 
@@ -261,6 +268,7 @@ Prometheus metrics (the `rpc_method` label is restricted to known Solana methods
 | `rpc_failovers_total` | counter | `rpc_method` |
 | `rpc_fanout_total` | counter | `rpc_method`, `outcome` (`ok`, `failed`) |
 | `rpc_blocked_total` | counter | `rpc_method`, `owner` |
+| `rpc_backends_at_capacity_total` | counter | `rpc_method` |
 | `rpc_backend_health` | gauge | `backend` (1 healthy, 0 not) |
 | `rpc_backend_slot` | gauge | `backend` |
 | `rpc_backend_slot_lag` | gauge | `backend` (slots behind the best backend) |

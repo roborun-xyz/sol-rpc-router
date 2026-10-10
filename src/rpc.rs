@@ -23,6 +23,7 @@ pub mod codes {
     pub const NO_BACKEND: i64 = -32093;
     pub const UPSTREAM_ERROR: i64 = -32094;
     pub const UPSTREAM_TIMEOUT: i64 = -32095;
+    pub const BACKENDS_AT_CAPACITY: i64 = -32096;
 }
 
 /// Label used for batch (array) JSON-RPC requests in logs and metrics.

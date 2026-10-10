@@ -30,6 +30,7 @@ label = "public"
 url = "https://api.mainnet-beta.solana.com"
 ws_url = "wss://api.mainnet-beta.solana.com"
 weight = 1
+max_rps = 8          # upstream budget for this backend (req/s); 0 or absent = unlimited
 
 [proxy]
 timeout_secs = 30                      # per-attempt upstream timeout

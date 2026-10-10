@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [0.2.0] - 2026-10-08
 
 ### Added
+- Per-backend `max_rps`: a token-bucket budget per provider; backends out of budget are skipped (429 with `Retry-After` only when all are), so free-tier and paid providers can share a pool without upstream 429s.
 - File-based keystore: list keys under `[[api_keys]]` and leave `redis_url` empty to run without Redis (single instance, in-process limits, SIGHUP reload).
 - `proxy.max_ws_connections_per_key` caps concurrent WebSocket sessions per key (default 100).
 - Automatic failover: transport errors, timeouts and HTTP 408/429/5xx are retried on another healthy backend (`proxy.max_retries`).

@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -65,13 +64,11 @@ async fn test_proxy_handler_success() {
         label: "mock-backend".to_string(),
         url: backend_url.clone(),
         ws_url: None,
+        max_rps: 0,
         weight: 100,
     };
 
-    let runtime_backend = RuntimeBackend {
-        config: backend,
-        healthy: Arc::new(AtomicBool::new(true)),
-    };
+    let runtime_backend = RuntimeBackend::new(backend, true);
 
     let health_state = Arc::new(HealthState::new(vec!["mock-backend".to_string()]));
     let state = make_app_state(client, keystore, vec![runtime_backend], health_state);
@@ -209,13 +206,11 @@ async fn test_proxy_no_healthy_backends() {
         label: "sick-backend".to_string(),
         url: backend_url.clone(),
         ws_url: None,
+        max_rps: 0,
         weight: 1,
     };
 
-    let runtime_backend = RuntimeBackend {
-        config: backend,
-        healthy: Arc::new(AtomicBool::new(false)), // Start unhealthy
-    };
+    let runtime_backend = RuntimeBackend::new(backend, false); // Start unhealthy
 
     let health_state = Arc::new(HealthState::new(vec!["sick-backend".to_string()]));
     let state = make_app_state(client, keystore, vec![runtime_backend], health_state);
@@ -244,10 +239,7 @@ fn make_health_state(backends: &[Backend]) -> Arc<AppState> {
 
     let runtime_backends = backends
         .iter()
-        .map(|b| RuntimeBackend {
-            config: b.clone(),
-            healthy: Arc::new(AtomicBool::new(true)),
-        })
+        .map(|b| RuntimeBackend::new(b.clone(), true))
         .collect();
 
     make_app_state(client, keystore, runtime_backends, health_state)
@@ -259,12 +251,14 @@ fn test_backends() -> Vec<Backend> {
             label: "a".to_string(),
             url: "http://a".to_string(),
             ws_url: None,
+            max_rps: 0,
             weight: 1,
         },
         Backend {
             label: "b".to_string(),
             url: "http://b".to_string(),
             ws_url: None,
+            max_rps: 0,
             weight: 1,
         },
     ]

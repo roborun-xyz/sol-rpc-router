@@ -61,6 +61,7 @@ async fn start_router_inner(ws_url: Option<String>, healthy: bool, cap: u32) -> 
             label: "echo".into(),
             url: "http://unused".into(),
             ws_url,
+            max_rps: 0,
             weight: 1,
         },
         healthy,

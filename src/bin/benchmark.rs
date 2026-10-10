@@ -71,6 +71,7 @@ async fn start_router(upstream_addr: SocketAddr) -> SocketAddr {
         label: "mock-upstream".to_string(),
         url: format!("http://{}", upstream_addr),
         ws_url: None,
+        max_rps: 0,
         weight: 1,
     };
 

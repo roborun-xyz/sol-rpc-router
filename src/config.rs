@@ -131,6 +131,13 @@ pub struct Backend {
     pub url: String,
     pub weight: u32,
     pub ws_url: Option<String>,
+    /// Upstream request budget for this backend in requests per second
+    /// (burst of one second). `0` means unlimited. When a backend is out of
+    /// budget it is skipped in favour of others that still have some, so a
+    /// free-tier provider can sit next to a paid one without tripping its
+    /// limit.
+    #[serde(default)]
+    pub max_rps: u32,
 }
 
 pub fn load_config(config_path: &str) -> Result<Config, Box<dyn std::error::Error>> {

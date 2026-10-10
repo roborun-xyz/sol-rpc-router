@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::{collections::HashMap, sync::Arc};
 
 use arc_swap::ArcSwap;
@@ -21,22 +21,21 @@ fn create_test_state() -> AppState {
             label: "primary".to_string(),
             url: "http://primary".to_string(),
             ws_url: None,
+            max_rps: 0,
             weight: 100,
         },
         Backend {
             label: "secondary".to_string(),
             url: "http://secondary".to_string(),
             ws_url: None,
+            max_rps: 0,
             weight: 0,
         },
     ];
 
     let backends = backend_configs
         .iter()
-        .map(|b| RuntimeBackend {
-            config: b.clone(),
-            healthy: Arc::new(AtomicBool::new(true)),
-        })
+        .map(|b| RuntimeBackend::new(b.clone(), true))
         .collect();
 
     let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
@@ -58,24 +57,26 @@ fn test_select_backend_weighted() {
     let keystore = Arc::new(MockKeyStore::new());
 
     let backends = vec![
-        RuntimeBackend {
-            config: Backend {
+        RuntimeBackend::new(
+            Backend {
                 label: "primary".to_string(),
                 url: "http://primary".to_string(),
                 ws_url: None,
+                max_rps: 0,
                 weight: 1,
             },
-            healthy: Arc::new(AtomicBool::new(true)),
-        },
-        RuntimeBackend {
-            config: Backend {
+            true,
+        ),
+        RuntimeBackend::new(
+            Backend {
                 label: "secondary".to_string(),
                 url: "http://secondary".to_string(),
                 ws_url: None,
+                max_rps: 0,
                 weight: 1,
             },
-            healthy: Arc::new(AtomicBool::new(true)),
-        },
+            true,
+        ),
     ];
 
     let health_state = Arc::new(HealthState::new(vec![
@@ -116,24 +117,26 @@ fn test_select_backend_method_override() {
     let keystore = Arc::new(MockKeyStore::new());
 
     let backends = vec![
-        RuntimeBackend {
-            config: Backend {
+        RuntimeBackend::new(
+            Backend {
                 label: "primary".to_string(),
                 url: "http://primary".to_string(),
                 ws_url: None,
+                max_rps: 0,
                 weight: 100,
             },
-            healthy: Arc::new(AtomicBool::new(true)),
-        },
-        RuntimeBackend {
-            config: Backend {
+            true,
+        ),
+        RuntimeBackend::new(
+            Backend {
                 label: "secondary".to_string(),
                 url: "http://secondary".to_string(),
                 ws_url: None,
+                max_rps: 0,
                 weight: 0,
             },
-            healthy: Arc::new(AtomicBool::new(true)),
-        },
+            true,
+        ),
     ];
 
     let health_state = Arc::new(HealthState::new(vec![
@@ -215,22 +218,21 @@ fn create_ws_test_state() -> AppState {
             label: "ws-a".to_string(),
             url: "http://ws-a".to_string(),
             ws_url: Some("ws://ws-a".to_string()),
+            max_rps: 0,
             weight: 1,
         },
         Backend {
             label: "ws-b".to_string(),
             url: "http://ws-b".to_string(),
             ws_url: Some("ws://ws-b".to_string()),
+            max_rps: 0,
             weight: 1,
         },
     ];
 
     let backends = backend_configs
         .iter()
-        .map(|b| RuntimeBackend {
-            config: b.clone(),
-            healthy: Arc::new(AtomicBool::new(true)),
-        })
+        .map(|b| RuntimeBackend::new(b.clone(), true))
         .collect();
 
     let backend_labels = backend_configs.iter().map(|b| b.label.clone()).collect();
@@ -297,4 +299,100 @@ fn test_select_backend_excludes_tried_labels() {
     assert!(rs
         .select_backend(None, &["primary".to_string(), "secondary".to_string()])
         .is_none());
+}
+
+#[test]
+fn test_max_rps_budget_skips_exhausted_backend() {
+    let https = HttpsConnector::new();
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+    let keystore = Arc::new(MockKeyStore::new());
+
+    let backends = vec![
+        RuntimeBackend::new(
+            Backend {
+                label: "metered".to_string(),
+                url: "http://metered".to_string(),
+                ws_url: None,
+                weight: 1,
+                max_rps: 2,
+            },
+            true,
+        ),
+        RuntimeBackend::new(
+            Backend {
+                label: "unlimited".to_string(),
+                url: "http://unlimited".to_string(),
+                ws_url: None,
+                weight: 1,
+                max_rps: 0,
+            },
+            true,
+        ),
+    ];
+    let health_state = Arc::new(HealthState::new(vec![
+        "metered".to_string(),
+        "unlimited".to_string(),
+    ]));
+    let mut method_routes = HashMap::new();
+    method_routes.insert("getSlot".to_string(), "metered".to_string());
+    let router_state = RouterState {
+        method_routes,
+        ..RouterState::simple(backends, health_state)
+    };
+    let state = AppState::new(
+        client,
+        keystore,
+        Arc::new(ArcSwap::from_pointee(router_state)),
+    );
+    let rs = state.state.load();
+
+    // Pinned to the metered backend while it has budget...
+    assert_eq!(
+        rs.select_backend(Some("getSlot"), &[]).unwrap().label,
+        "metered"
+    );
+    assert_eq!(
+        rs.select_backend(Some("getSlot"), &[]).unwrap().label,
+        "metered"
+    );
+    // ...then falls through to the backend that still has capacity.
+    for _ in 0..20 {
+        assert_eq!(
+            rs.select_backend(Some("getSlot"), &[]).unwrap().label,
+            "unlimited"
+        );
+    }
+}
+
+#[test]
+fn test_all_backends_at_capacity_is_distinguishable_from_unhealthy() {
+    let https = HttpsConnector::new();
+    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
+    let keystore = Arc::new(MockKeyStore::new());
+    let backends = vec![RuntimeBackend::new(
+        Backend {
+            label: "metered".to_string(),
+            url: "http://metered".to_string(),
+            ws_url: None,
+            weight: 1,
+            max_rps: 1,
+        },
+        true,
+    )];
+    let health_state = Arc::new(HealthState::new(vec!["metered".to_string()]));
+    let state = AppState::new(
+        client,
+        keystore,
+        Arc::new(ArcSwap::from_pointee(RouterState::simple(
+            backends,
+            health_state,
+        ))),
+    );
+    let rs = state.state.load();
+    assert!(rs.select_backend(None, &[]).is_some());
+    assert!(rs.select_backend(None, &[]).is_none());
+    assert!(
+        rs.any_healthy(),
+        "out of budget is not the same as unhealthy"
+    );
 }

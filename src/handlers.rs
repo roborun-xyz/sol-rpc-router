@@ -589,6 +589,17 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
 
     let attempts = tried.len() as u32;
     match last_error {
+        None if attempts == 0 && rs.any_healthy() => {
+            // Everything healthy is out of upstream budget right now.
+            counter!("rpc_backends_at_capacity_total", "rpc_method" => rpc::metric_label(rpc_method.unwrap_or("")).to_string()).increment(1);
+            let resp = rpc::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                codes::BACKENDS_AT_CAPACITY,
+                "All backends are at their configured max_rps; retry shortly",
+                rpc_id,
+            );
+            tag_response(resp, "none", &owner, attempts)
+        }
         None => {
             error!("No healthy backends available for request");
             let resp = rpc::error_response(
