@@ -372,6 +372,108 @@ async fn all_backends_dead_returns_502_jsonrpc_error() {
     assert_eq!(json["id"], 1);
 }
 
+/// Every piece of the hyper error chain for a request to `url`, i.e. the
+/// text a leaky 502 would have exposed.
+async fn transport_error_texts(url: &str) -> Vec<String> {
+    let client: Client<_, Body> =
+        Client::builder(hyper_util::rt::TokioExecutor::new()).build(HttpsConnector::new());
+    let req = Request::builder()
+        .method("POST")
+        .uri(url)
+        .body(Body::empty())
+        .unwrap();
+    let err = client.request(req).await.unwrap_err();
+    let mut texts = vec![err.to_string()];
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        texts.push(cause.to_string());
+        source = cause.source();
+    }
+    texts
+}
+
+/// Asserts a router error body names neither the backend nor the cause.
+fn assert_no_upstream_details(body: &str, urls: &[&str], error_texts: &[String]) {
+    for url in urls {
+        let authority = url.trim_start_matches("http://");
+        let (host, port) = authority.split_once(':').unwrap();
+        assert!(
+            !body.contains(authority),
+            "body leaks backend address: {}",
+            body
+        );
+        assert!(!body.contains(host), "body leaks backend host: {}", body);
+        assert!(
+            !body.contains(&format!(":{}", port)),
+            "body leaks backend port: {}",
+            body
+        );
+    }
+    for text in error_texts {
+        assert!(
+            !body.contains(text.as_str()),
+            "body leaks '{}': {}",
+            text,
+            body
+        );
+    }
+}
+
+#[tokio::test]
+async fn transport_failure_502_does_not_leak_upstream_details() {
+    let dead1 = dead_backend_url().await;
+    let dead2 = dead_backend_url().await;
+    let error_texts = transport_error_texts(&dead1).await;
+    assert!(!error_texts.is_empty());
+    let app = build_app(
+        vec![backend("d1", &dead1, 1), backend("d2", &dead2, 1)],
+        HashMap::new(),
+        fast_proxy(1),
+    );
+
+    let resp = app
+        .router
+        .oneshot(rpc_request("/?api-key=test-key", "getSlot"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], -32094);
+    assert_eq!(
+        json["error"]["message"],
+        "Upstream request failed (2 attempt(s))"
+    );
+    assert_no_upstream_details(&json.to_string(), &[&dead1, &dead2], &error_texts);
+}
+
+#[tokio::test]
+async fn fanout_transport_failure_502_does_not_leak_upstream_details() {
+    let dead1 = dead_backend_url().await;
+    let dead2 = dead_backend_url().await;
+    let error_texts = transport_error_texts(&dead1).await;
+    let cfg = ProxyConfig {
+        timeout_secs: 2,
+        fanout_methods: vec!["sendTransaction".into()],
+        ..Default::default()
+    };
+    let app = build_app(
+        vec![backend("d1", &dead1, 1), backend("d2", &dead2, 1)],
+        HashMap::new(),
+        cfg,
+    );
+
+    let resp = app
+        .router
+        .oneshot(rpc_request("/?api-key=test-key", "sendTransaction"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], -32094);
+    assert_eq!(json["error"]["message"], "All 2 backends failed");
+    assert_no_upstream_details(&json.to_string(), &[&dead1, &dead2], &error_texts);
+}
+
 // --- Fan-out ----------------------------------------------------------------
 
 #[tokio::test]
