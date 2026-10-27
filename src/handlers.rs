@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -15,8 +16,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures_util::{stream, SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use metrics::{counter, gauge, histogram};
 use rand::{distributions::Alphanumeric, Rng};
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     sync::mpsc,
-    time::{timeout, Duration},
+    time::{timeout, timeout_at, Duration, Instant},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 use tracing::{error, info, warn};
@@ -40,6 +41,11 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 /// Fan-out responses are buffered so we can inspect them; sendTransaction
 /// replies are tiny, so this is generous.
 const MAX_FANOUT_RESPONSE_SIZE: usize = 1024 * 1024;
+/// Normal-path responses up to this size are read in full before anything is
+/// sent to the client, so a backend that stalls mid-body is a retryable
+/// timeout. Larger responses are streamed; the attempt deadline still bounds
+/// the rest of the body, but a stall there can only abort the response.
+const MAX_BUFFERED_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Slow-body clients are cut off after this long.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -417,16 +423,110 @@ enum AttemptError {
     Transport(String),
 }
 
+/// Sends one upstream request; resolves once the response headers arrive.
 async fn send_once(
     client: &HttpClient,
     req: Request<Body>,
-    timeout_secs: u64,
+    deadline: Instant,
 ) -> Result<hyper::Response<hyper::body::Incoming>, AttemptError> {
-    match timeout(Duration::from_secs(timeout_secs), client.request(req)).await {
+    match timeout_at(deadline, client.request(req)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(AttemptError::Transport(e.to_string())),
         Err(_) => Err(AttemptError::Timeout),
     }
+}
+
+enum ReadBody {
+    /// The whole body arrived before the deadline.
+    Complete(Bytes),
+    /// The body is larger than the limit: what was read so far, and the rest.
+    Overflow(Bytes, hyper::body::Incoming),
+}
+
+/// Reads an upstream body until it ends, `deadline` passes or it grows past
+/// `limit`. hyper hands back responses as soon as the headers arrive, so this
+/// is what keeps a backend that stalls mid-body inside the attempt timeout.
+async fn read_body(
+    mut body: hyper::body::Incoming,
+    limit: usize,
+    deadline: Instant,
+) -> Result<ReadBody, AttemptError> {
+    // A declared length over the limit goes straight to streaming.
+    if axum::body::HttpBody::size_hint(&body).lower() > limit as u64 {
+        return Ok(ReadBody::Overflow(Bytes::new(), body));
+    }
+    let mut buf = BytesMut::new();
+    loop {
+        match timeout_at(deadline, body.frame()).await {
+            Err(_) => return Err(AttemptError::Timeout),
+            Ok(None) => return Ok(ReadBody::Complete(buf.freeze())),
+            Ok(Some(Err(e))) => {
+                return Err(AttemptError::Transport(format!("body read failed: {}", e)))
+            }
+            Ok(Some(Ok(frame))) => {
+                // Trailers are dropped; JSON-RPC does not use them.
+                if let Ok(data) = frame.into_data() {
+                    buf.extend_from_slice(&data);
+                    if buf.len() > limit {
+                        return Ok(ReadBody::Overflow(buf.freeze(), body));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Turns an upstream response into the client response, buffering bodies up
+/// to `MAX_BUFFERED_RESPONSE_SIZE` within `deadline`.
+async fn read_response(
+    resp: hyper::Response<hyper::body::Incoming>,
+    deadline: Instant,
+    label: &str,
+) -> Result<Response, AttemptError> {
+    let (parts, body) = resp.into_parts();
+    let body = match read_body(body, MAX_BUFFERED_RESPONSE_SIZE, deadline).await? {
+        ReadBody::Complete(bytes) => Body::from(bytes),
+        ReadBody::Overflow(prefix, rest) => {
+            deadline_body(prefix, rest, deadline, label.to_string())
+        }
+    };
+    Ok(Response::from_parts(parts, body))
+}
+
+/// Streams `prefix` then the rest of `body`, aborting it at `deadline`.
+fn deadline_body(
+    prefix: Bytes,
+    body: hyper::body::Incoming,
+    deadline: Instant,
+    label: String,
+) -> Body {
+    let head = stream::once(async move { Ok::<_, io::Error>(prefix) });
+    let tail = stream::unfold(Some(body), move |body| {
+        let label = label.clone();
+        async move {
+            let mut body = body?;
+            loop {
+                match timeout_at(deadline, body.frame()).await {
+                    Err(_) => {
+                        warn!(
+                            "backend={} response body still streaming at the deadline, aborting",
+                            label
+                        );
+                        let e = io::Error::new(io::ErrorKind::TimedOut, "upstream body timed out");
+                        return Some((Err(e), None));
+                    }
+                    Ok(None) => return None,
+                    Ok(Some(Err(e))) => return Some((Err(io::Error::other(e)), None)),
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(data) = frame.into_data() {
+                            return Some((Ok(data), Some(body)));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Body::from_stream(head.chain(tail))
 }
 
 fn tag_response(mut resp: Response, backend: &str, owner: &str, attempts: u32) -> Response {
@@ -540,25 +640,30 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
         tried.push(selection.label.clone());
 
         let has_more = attempt < max_attempts;
-        let started = std::time::Instant::now();
-        let result = send_once(&state.client, req, timeout_secs).await;
+        let started = Instant::now();
+        // One deadline for the whole exchange: headers and body.
+        let deadline = started + Duration::from_secs(timeout_secs);
+        let result = match send_once(&state.client, req, deadline).await {
+            Ok(resp) if upstream::is_retryable_status(resp.status()) && has_more => {
+                rs.record_latency(&selection.label, started.elapsed());
+                counter!("rpc_upstream_attempts_total", "backend" => selection.label.clone(), "outcome" => "retryable_status").increment(1);
+                warn!(
+                    "backend={} returned {} for {}, retrying on another backend (attempt {}/{})",
+                    selection.label,
+                    resp.status().as_u16(),
+                    rpc_method.unwrap_or("-"),
+                    attempt,
+                    max_attempts
+                );
+                continue;
+            }
+            Ok(resp) => read_response(resp, deadline, &selection.label).await,
+            Err(e) => Err(e),
+        };
         rs.record_latency(&selection.label, started.elapsed());
         match result {
             Ok(resp) => {
-                let status = resp.status();
-                if upstream::is_retryable_status(status) && has_more {
-                    counter!("rpc_upstream_attempts_total", "backend" => selection.label.clone(), "outcome" => "retryable_status").increment(1);
-                    warn!(
-                        "backend={} returned {} for {}, retrying on another backend (attempt {}/{})",
-                        selection.label,
-                        status.as_u16(),
-                        rpc_method.unwrap_or("-"),
-                        attempt,
-                        max_attempts
-                    );
-                    continue;
-                }
-                let outcome = if status.is_success() {
+                let outcome = if resp.status().is_success() {
                     "ok"
                 } else {
                     "upstream_status"
@@ -567,7 +672,7 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
                 if attempt > 1 {
                     counter!("rpc_failovers_total", "rpc_method" => rpc::metric_label(rpc_method.unwrap_or("")).to_string()).increment(1);
                 }
-                return tag_response(resp.into_response(), &selection.label, &owner, attempt);
+                return tag_response(resp, &selection.label, &owner, attempt);
             }
             Err(e) => {
                 let outcome = match &e {
@@ -680,28 +785,24 @@ async fn fanout(
         // Spawned (not merely polled) so every backend still receives the
         // transaction even after we've already answered the client.
         tokio::spawn(async move {
-            let outcome = match send_once(&client, req, timeout_secs).await {
+            let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+            let read = match send_once(&client, req, deadline).await {
                 Ok(resp) => {
-                    let status = resp.status();
-                    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
-                    let bytes = match http_body_util::Limited::new(
-                        resp.into_body(),
-                        MAX_FANOUT_RESPONSE_SIZE,
-                    )
-                    .collect()
-                    .await
-                    {
-                        Ok(c) => c.to_bytes(),
-                        Err(e) => {
-                            let _ = tx
-                                .send((
-                                    selection.label.clone(),
-                                    FanoutOutcome::Failed(format!("body read failed: {}", e)),
-                                ))
-                                .await;
-                            return;
-                        }
-                    };
+                    let (parts, body) = resp.into_parts();
+                    read_body(body, MAX_FANOUT_RESPONSE_SIZE, deadline)
+                        .await
+                        .map(|b| (parts, b))
+                }
+                Err(e) => Err(e),
+            };
+            let outcome = match read {
+                Ok((_, ReadBody::Overflow(..))) => FanoutOutcome::Failed(format!(
+                    "response larger than {} bytes",
+                    MAX_FANOUT_RESPONSE_SIZE
+                )),
+                Ok((parts, ReadBody::Complete(bytes))) => {
+                    let status = parts.status;
+                    let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
                     let is_rpc_error = serde_json::from_slice::<Value>(&bytes)
                         .map(|v| v.get("error").is_some())
                         .unwrap_or(true);

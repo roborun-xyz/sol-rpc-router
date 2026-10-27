@@ -940,3 +940,177 @@ async fn max_rps_exhaustion_returns_429_with_retry_after() {
         "no upstream call over budget"
     );
 }
+
+// --- Response body deadline -------------------------------------------------
+
+/// A raw TCP backend that sends response headers and part of the body, then
+/// holds the connection open without sending the rest.
+async fn stalling_body_backend() -> MockBackend {
+    stalling_body_backend_with_length(64).await
+}
+
+async fn stalling_body_backend_with_length(content_length: usize) -> MockBackend {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let hits = hits_clone.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                hits.fetch_add(1, Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{{\"jsonrpc\":\"2.0\",",
+                    content_length
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                drop(sock);
+            });
+        }
+    });
+    MockBackend {
+        url: format!("http://{}", addr),
+        hits,
+    }
+}
+
+/// Fails the test instead of hanging it if the router never answers.
+async fn within_deadline(
+    router: Router,
+    req: Request<Body>,
+    secs: u64,
+) -> axum::response::Response {
+    tokio::time::timeout(std::time::Duration::from_secs(secs), router.oneshot(req))
+        .await
+        .expect("router did not answer within the deadline")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stalled_response_body_times_out_with_504() {
+    let b = stalling_body_backend().await;
+    let app = build_app(
+        vec![backend("stall", &b.url, 1)],
+        HashMap::new(),
+        ProxyConfig {
+            timeout_secs: 1,
+            max_retries: 0,
+            ..Default::default()
+        },
+    );
+    let resp = within_deadline(app.router, rpc_request("/?api-key=test-key", "getSlot"), 5).await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(resp.headers().get(BACKEND_HEADER).unwrap(), "stall");
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], -32095);
+    assert_eq!(json["id"], 1);
+}
+
+#[tokio::test]
+async fn stalled_response_body_fails_over_to_another_backend() {
+    let stall = stalling_body_backend().await;
+    let good = start_backend(ok_backend()).await;
+    let routes = HashMap::from([("getSlot".to_string(), "stall".to_string())]);
+    let app = build_app(
+        vec![
+            backend("stall", &stall.url, 1),
+            backend("good", &good.url, 1),
+        ],
+        routes,
+        ProxyConfig {
+            timeout_secs: 1,
+            max_retries: 1,
+            ..Default::default()
+        },
+    );
+    let resp = within_deadline(app.router, rpc_request("/?api-key=test-key", "getSlot"), 5).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get(BACKEND_HEADER).unwrap(), "good");
+    assert_eq!(resp.headers().get(ATTEMPTS_HEADER).unwrap(), "2");
+    assert_eq!(stall.hits.load(Ordering::SeqCst), 1);
+    let json = body_json(resp).await;
+    assert_eq!(json["result"], 123);
+}
+
+#[tokio::test]
+async fn fanout_stalled_response_bodies_time_out() {
+    let b1 = stalling_body_backend().await;
+    let b2 = stalling_body_backend().await;
+    let cfg = ProxyConfig {
+        timeout_secs: 1,
+        fanout_methods: vec!["sendTransaction".into()],
+        ..Default::default()
+    };
+    let app = build_app(
+        vec![backend("b1", &b1.url, 1), backend("b2", &b2.url, 1)],
+        HashMap::new(),
+        cfg,
+    );
+    let resp = within_deadline(
+        app.router,
+        rpc_request("/?api-key=test-key", "sendTransaction"),
+        5,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], -32094);
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("timed out after 1s"), "{}", msg);
+}
+
+#[tokio::test]
+async fn responses_over_the_buffer_cap_are_streamed_intact() {
+    // Larger than the 10 MB buffering cap, so this takes the streaming path.
+    let big = format!(
+        r#"{{"jsonrpc":"2.0","result":"{}","id":1}}"#,
+        "a".repeat(11 * 1024 * 1024)
+    );
+    let len = big.len();
+    let b = start_backend(Arc::new(move |_, _| (StatusCode::OK, big.clone()))).await;
+    let app = build_app(
+        vec![backend("big", &b.url, 1)],
+        HashMap::new(),
+        fast_proxy(0),
+    );
+    let resp = within_deadline(
+        app.router,
+        rpc_request("/?api-key=test-key", "getProgramAccounts"),
+        10,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.len(), len);
+}
+
+#[tokio::test]
+async fn streamed_response_body_is_aborted_at_the_deadline() {
+    // Declares more than the buffering cap, so headers go out right away and
+    // the stall can only cut the body short.
+    let b = stalling_body_backend_with_length(20 * 1024 * 1024).await;
+    let app = build_app(
+        vec![backend("stall", &b.url, 1)],
+        HashMap::new(),
+        ProxyConfig {
+            timeout_secs: 1,
+            max_retries: 0,
+            ..Default::default()
+        },
+    );
+    let resp = within_deadline(app.router, rpc_request("/?api-key=test-key", "getSlot"), 5).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        resp.into_body().collect(),
+    )
+    .await
+    .expect("streamed body was not cut off at the deadline");
+    assert!(read.is_err());
+}

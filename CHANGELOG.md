@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- `proxy.timeout_secs` now covers reading the upstream response body, not just the headers, on both the normal and fan-out paths. A backend that stalls mid-body times out (504 / -32095), is retried on another backend and counts as a `timeout` attempt. Responses up to 10 MB are buffered to make this possible; larger ones are streamed and aborted at the deadline.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
