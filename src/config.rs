@@ -14,6 +14,11 @@ pub struct Config {
     /// `REDIS_URL` env var. Leave empty to use `[[api_keys]]` from this file.
     #[serde(default)]
     pub redis_url: String,
+    /// Redis keystore only: seconds a valid key is cached by the router, i.e.
+    /// how long revocations and limit changes take to apply. Unknown keys are
+    /// cached for at most 5 s. `0` disables caching. Applies after a restart.
+    #[serde(default = "default_key_cache_ttl_secs")]
+    pub key_cache_ttl_secs: u64,
     /// Inline API keys. Used when `redis_url` is empty; keys are reloaded on
     /// SIGHUP. Rate limits are enforced in-process, so this mode suits a
     /// single router instance.
@@ -121,6 +126,10 @@ pub struct ApiKeyConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_key_cache_ttl_secs() -> u64 {
+    crate::keystore::KEY_CACHE_TTL.as_secs()
 }
 
 /// Which keystore a config selects.

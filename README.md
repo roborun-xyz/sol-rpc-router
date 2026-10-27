@@ -199,7 +199,7 @@ Two keystores; the config picks one.
 
 **Config file** (`redis_url` empty, `[[api_keys]]` present): each entry has `key`, `owner`, optional `rate_limit` (req/s, `0` = unlimited), `expires_at` (unix seconds, `0` = never) and `active`. Changes apply on `SIGHUP`. Limits are per-second windows kept in memory, so they are per router instance. No `rpc-admin` needed.
 
-**Redis** (`redis_url` set): keys are hashes (`api_key:<key>`) with `owner`, `rate_limit`, `active`, `created_at` and optional `expires_at`, managed with `rpc-admin`. The router caches lookups for 60 s, so revocations and limit changes take up to a minute to apply. Rate limits are per-second counters enforced atomically in Redis, so they hold across multiple router instances sharing one Redis.
+**Redis** (`redis_url` set): keys are hashes (`api_key:<key>`) with `owner`, `rate_limit`, `active`, `created_at` and optional `expires_at`, managed with `rpc-admin`. The router caches valid keys for `key_cache_ttl_secs` (default 60 s), so revocations and limit changes take up to that long to apply; set it lower (or `0` to disable the cache) for faster propagation at the cost of more Redis lookups. A cached key is still rejected the moment its `expires_at` passes. Unknown keys are cached for 5 s, so a key created with `rpc-admin create` works within 5 s even on a router that just rejected it. Rate limits are per-second counters enforced atomically in Redis, so they hold across multiple router instances sharing one Redis.
 
 ```bash
 rpc-admin create alice --rate-limit 50                 # 50 req/s, never expires

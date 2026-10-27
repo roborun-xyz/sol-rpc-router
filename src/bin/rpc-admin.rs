@@ -6,7 +6,9 @@ use std::{
 use clap::{Parser, Subcommand};
 use rand::{distributions::Alphanumeric, Rng};
 use redis::AsyncCommands;
-use sol_rpc_router::keystore::{KEY_INDEX, KEY_PREFIX, RATE_LIMIT_PREFIX};
+use sol_rpc_router::keystore::{
+    KEY_CACHE_TTL, KEY_INDEX, KEY_PREFIX, NEGATIVE_KEY_CACHE_TTL, RATE_LIMIT_PREFIX,
+};
 
 #[derive(Parser)]
 #[command(name = "rpc-admin", version)]
@@ -71,6 +73,15 @@ enum Commands {
     },
     /// Inspect an API key
     Inspect { key: String },
+}
+
+/// How long a change takes to reach routers that cached the key.
+fn propagation_note(what: &str) -> String {
+    format!(
+        "(running routers {} within their key_cache_ttl_secs, {}s by default)",
+        what,
+        KEY_CACHE_TTL.as_secs()
+    )
 }
 
 fn parse_duration_secs(s: &str) -> Result<u64, String> {
@@ -176,6 +187,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!();
             println!("  rate limit: {}", fmt_rate_limit(rate_limit));
             println!("  expires:    {}", fmt_expiry(expires_at, now));
+            println!(
+                "(usable right away; a router that rejected this key just before may keep doing so for up to {}s)",
+                NEGATIVE_KEY_CACHE_TTL.as_secs()
+            );
         }
         Commands::Revoke { key } => {
             let rk = redis_key(&key);
@@ -183,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if exists {
                 let _: () = con.hset(&rk, "active", "false").await?;
                 println!("Revoked key: {}", key);
-                println!("(running routers pick this up within 60s)");
+                println!("{}", propagation_note("stop accepting it"));
             } else {
                 println!("Key not found: {}", key);
             }
@@ -256,7 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for change in changes {
                     println!("  {}", change);
                 }
-                println!("(running routers pick this up within 60s)");
+                println!("{}", propagation_note("pick this up"));
             }
         }
         Commands::List { owner: filter } => {
