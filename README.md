@@ -205,7 +205,7 @@ Two keystores; the config picks one.
 rpc-admin create alice --rate-limit 50                 # 50 req/s, never expires
 rpc-admin create trial --rate-limit 10 --expires-in 7d # relative expiry (s, m, h, d, w); or --expires-at <unix>
 rpc-admin create ci --rate-limit 0 --key my-fixed-key  # 0 = unlimited; custom key value
-rpc-admin list [--owner alice]
+rpc-admin list [--owner alice] [--active-only] [--limit 50 --offset 0]   # sorted by owner, then key
 rpc-admin inspect <key>                                 # includes requests used this second
 rpc-admin update <key> --rate-limit 100 --owner bob --active false --expires-in 30d   # or --expires-at <unix>, 0 clears
 rpc-admin revoke <key>                                  # keeps metadata, stops working

@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- `rpc-admin list` walks the key index with `SSCAN` and fetches each batch of key hashes in one pipeline instead of one round trip per key. Output is unchanged.
+
+### Added
+- `rpc-admin list --limit/--offset` for paging (only the requested page is kept in memory) and `--active-only` to hide revoked, expired and missing keys.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

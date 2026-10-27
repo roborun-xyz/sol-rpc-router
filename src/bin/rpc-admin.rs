@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -68,6 +68,18 @@ enum Commands {
         /// Only show keys for this owner
         #[arg(long)]
         owner: Option<String>,
+        /// Only show active keys (hide revoked, expired and missing ones)
+        #[arg(long)]
+        active_only: bool,
+        /// Show at most this many keys (after filtering, in OWNER/KEY order)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip this many keys before the first one shown
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Keys fetched per SSCAN round trip
+        #[arg(long, default_value_t = 500, hide = true)]
+        batch_size: usize,
     },
     /// Inspect an API key
     Inspect { key: String },
@@ -259,59 +271,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("(running routers pick this up within 60s)");
             }
         }
-        Commands::List { owner: filter } => {
-            let keys: Vec<String> = con.smembers(KEY_INDEX).await?;
-            let now = now_unix();
-            let mut rows = Vec::new();
+        Commands::List {
+            owner,
+            active_only,
+            limit,
+            offset,
+            batch_size,
+        } => {
+            let filter = ListFilter {
+                owner,
+                active_only,
+                keep: limit.map(|l| offset.saturating_add(l)),
+            };
+            let (total, rows) = list_keys(&mut con, &filter, batch_size.max(1)).await?;
+            let shown: Vec<_> = rows
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
 
-            for key in keys {
-                let fields: HashMap<String, String> = con.hgetall(redis_key(&key)).await?;
-                if fields.is_empty() {
-                    rows.push((
-                        key,
-                        "-".to_string(),
-                        "missing".to_string(),
-                        String::new(),
-                        String::new(),
-                    ));
-                    continue;
-                }
-                let owner = fields.get("owner").cloned().unwrap_or_else(|| "-".into());
-                if let Some(f) = &filter {
-                    if &owner != f {
-                        continue;
-                    }
-                }
-                let active = fields.get("active").map(|a| a != "false").unwrap_or(true);
-                let expires_at = fields.get("expires_at").and_then(|v| v.parse().ok());
-                let expired = matches!(expires_at, Some(t) if t != 0 && t <= now);
-                let status = match (active, expired) {
-                    (false, _) => "revoked",
-                    (true, true) => "expired",
-                    (true, false) => "active",
-                };
-                let rl = fields
-                    .get("rate_limit")
-                    .and_then(|v| v.parse().ok())
-                    .map(fmt_rate_limit)
-                    .unwrap_or_else(|| "-".into());
-                rows.push((
-                    key,
-                    owner,
-                    status.to_string(),
-                    rl,
-                    fmt_expiry(expires_at, now),
-                ));
-            }
-
-            rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-            println!("Found {} key(s):", rows.len());
+            println!("Found {} key(s):", total);
             println!(
                 "{:<34} {:<20} {:<8} {:<12} EXPIRES",
                 "KEY", "OWNER", "STATUS", "RATE LIMIT"
             );
-            for (key, owner, status, rl, exp) in rows {
+            for ((owner, key), (status, rl, exp)) in &shown {
                 println!("{:<34} {:<20} {:<8} {:<12} {}", key, owner, status, rl, exp);
+            }
+            if limit.is_some() || offset > 0 {
+                let end = offset + shown.len();
+                if shown.is_empty() {
+                    println!("No keys at offset {}", offset);
+                } else {
+                    println!("Showing {}-{} of {}", offset + 1, end, total);
+                }
+                if end < total {
+                    println!("Next page: --offset {}", end);
+                }
             }
         }
         Commands::Inspect { key } => {
@@ -351,6 +347,113 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+struct ListFilter {
+    owner: Option<String>,
+    active_only: bool,
+    /// Keep only the first N rows in sort order (offset + limit); None keeps all.
+    keep: Option<usize>,
+}
+
+/// ((owner, key), (status, rate limit, expiry)); the map key gives the
+/// OWNER-then-KEY output order.
+type ListRow = ((String, String), (String, String, String));
+
+/// Walks the key index with SSCAN and fetches each batch's hashes in one
+/// pipeline. When paginating, only the first `keep` rows are held in memory.
+/// Returns the number of matching keys and the kept rows in display order.
+async fn list_keys(
+    con: &mut redis::aio::MultiplexedConnection,
+    filter: &ListFilter,
+    batch_size: usize,
+) -> redis::RedisResult<(usize, Vec<ListRow>)> {
+    let now = now_unix();
+    let mut rows = BTreeMap::new();
+    let mut total = 0;
+    let mut cursor: u64 = 0;
+
+    loop {
+        let (next, keys): (u64, Vec<String>) = redis::cmd("SSCAN")
+            .arg(KEY_INDEX)
+            .arg(cursor)
+            .arg("COUNT")
+            .arg(batch_size)
+            .query_async(con)
+            .await?;
+
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            pipe.hgetall(redis_key(key));
+        }
+        let hashes: Vec<HashMap<String, String>> = if keys.is_empty() {
+            Vec::new()
+        } else {
+            pipe.query_async(con).await?
+        };
+
+        for (key, fields) in keys.into_iter().zip(hashes) {
+            let Some((owner, info)) = list_row(&fields, filter, now) else {
+                continue;
+            };
+            // SSCAN may return a key more than once; count it once. (A repeat of
+            // a row already trimmed off the page can still be counted twice.)
+            if rows.insert((owner, key), info).is_none() {
+                total += 1;
+            }
+            if let Some(keep) = filter.keep {
+                if rows.len() > keep {
+                    rows.pop_last();
+                }
+            }
+        }
+
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    Ok((total, rows.into_iter().collect()))
+}
+
+/// Builds one list row, or None if the filter excludes it. Index entries with
+/// no hash are shown as "missing" regardless of `--owner`.
+fn list_row(
+    fields: &HashMap<String, String>,
+    filter: &ListFilter,
+    now: u64,
+) -> Option<(String, (String, String, String))> {
+    if fields.is_empty() {
+        if filter.active_only {
+            return None;
+        }
+        return Some((
+            "-".to_string(),
+            ("missing".to_string(), String::new(), String::new()),
+        ));
+    }
+    let owner = fields.get("owner").cloned().unwrap_or_else(|| "-".into());
+    if filter.owner.as_ref().is_some_and(|f| &owner != f) {
+        return None;
+    }
+    let active = fields.get("active").map(|a| a != "false").unwrap_or(true);
+    let expires_at = fields.get("expires_at").and_then(|v| v.parse().ok());
+    let expired = matches!(expires_at, Some(t) if t != 0 && t <= now);
+    let status = match (active, expired) {
+        (false, _) => "revoked",
+        (true, true) => "expired",
+        (true, false) => "active",
+    };
+    if filter.active_only && status != "active" {
+        return None;
+    }
+    let rl = fields
+        .get("rate_limit")
+        .and_then(|v| v.parse().ok())
+        .map(fmt_rate_limit)
+        .unwrap_or_else(|| "-".into());
+    Some((owner, (status.to_string(), rl, fmt_expiry(expires_at, now))))
 }
 
 fn fmt_rate_limit(rl: u64) -> String {
