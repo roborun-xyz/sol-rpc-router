@@ -113,24 +113,9 @@ fn new_request_id() -> String {
 /// body back so the handler can forward it.
 pub async fn extract_rpc_method(req: Request<Body>, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
-    let body_bytes = match timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_BODY_SIZE)).await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => {
-            return rpc::error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                codes::INVALID_REQUEST,
-                "Request body too large",
-                None,
-            );
-        }
-        Err(_) => {
-            return rpc::error_response(
-                StatusCode::REQUEST_TIMEOUT,
-                codes::INVALID_REQUEST,
-                "Timed out reading request body",
-                None,
-            );
-        }
+    let body_bytes = match read_body(body).await {
+        Ok(bytes) => bytes,
+        Err(e) => return e.into_response(None),
     };
 
     if let Some(info) = rpc::probe_request(&body_bytes) {
@@ -140,6 +125,66 @@ pub async fn extract_rpc_method(req: Request<Body>, next: Next) -> Response {
 
     next.run(Request::from_parts(parts, Body::from(body_bytes)))
         .await
+}
+
+/// Why a request body could not be read. Only a size-limit breach is a 413;
+/// slow clients get a 408 and everything else (client disconnect, malformed
+/// chunked encoding, ...) a 400.
+#[derive(Debug)]
+enum BodyReadError {
+    TooLarge,
+    Timeout,
+    Failed(axum::Error),
+}
+
+impl BodyReadError {
+    fn reason(&self) -> &'static str {
+        match self {
+            BodyReadError::TooLarge => "too_large",
+            BodyReadError::Timeout => "timeout",
+            BodyReadError::Failed(_) => "read_error",
+        }
+    }
+
+    fn into_response(self, id: Option<&Value>) -> Response {
+        let reason = self.reason();
+        counter!("rpc_body_read_errors_total", "reason" => reason).increment(1);
+        let (status, message) = match &self {
+            BodyReadError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large"),
+            BodyReadError::Timeout => (
+                StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+            ),
+            BodyReadError::Failed(e) => {
+                warn!("Failed to read request body: reason={} error={}", reason, e);
+                (StatusCode::BAD_REQUEST, "Failed to read request body")
+            }
+        };
+        rpc::error_response(status, codes::INVALID_REQUEST, message, id)
+    }
+}
+
+/// Buffers a request body, enforcing `MAX_BODY_SIZE` and `BODY_READ_TIMEOUT`.
+async fn read_body(body: Body) -> Result<Bytes, BodyReadError> {
+    match timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_BODY_SIZE)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) if is_length_limit_error(&e) => Err(BodyReadError::TooLarge),
+        Ok(Err(e)) => Err(BodyReadError::Failed(e)),
+        Err(_) => Err(BodyReadError::Timeout),
+    }
+}
+
+/// `to_bytes` reports a size-limit breach as an `http_body_util::LengthLimitError`
+/// somewhere in the error's source chain.
+fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 pub async fn log_requests(
@@ -472,17 +517,9 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
         }
     }
 
-    let body_bytes = match to_bytes(body, MAX_BODY_SIZE).await {
+    let body_bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(_) => {
-            let resp = rpc::error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                codes::INVALID_REQUEST,
-                "Request body too large",
-                rpc_id,
-            );
-            return tag_response(resp, "none", &owner, 0);
-        }
+        Err(e) => return tag_response(e.into_response(rpc_id), "none", &owner, 0),
     };
 
     let path = parts.uri.path().to_string();

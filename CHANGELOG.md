@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Request body read failures are no longer all reported as 413: only a body over 10 MB is 413, a slow body is 408 and other read errors (client disconnect, malformed chunked encoding) are 400. New counter `rpc_body_read_errors_total{reason}` tells them apart.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
