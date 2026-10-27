@@ -38,6 +38,8 @@ max_retries = 2                        # extra backends to try on connect errors
 fanout_methods = ["sendTransaction"]   # broadcast to every healthy backend, first success wins
 blocked_methods = []                   # e.g. ["getProgramAccounts"] to keep heavy calls off a shared key
 shutdown_grace_secs = 10               # drain time after SIGTERM before forcing exit
+ws_idle_timeout_secs = 300             # close WebSocket sessions with no frames either way for this long; 0 = never
+ws_ping_interval_secs = 30             # ping clients this often so live idle subscriptions stay open; 0 = no pings
 
 [health_check]
 interval_secs = 30                     # probe frequency

@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- WebSocket idle timeout: `proxy.ws_idle_timeout_secs` (default 300, `0` disables) closes sessions with no frames in either direction, sends a close frame to both peers, frees the per-key slot and counts `ws_connections_total{status="idle_timeout"}`. The router pings clients every `proxy.ws_ping_interval_secs` (default 30, `0` disables) so live idle subscriptions stay open while dead or half-open peers are dropped. Config validation rejects a ping interval that is not shorter than the idle timeout.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

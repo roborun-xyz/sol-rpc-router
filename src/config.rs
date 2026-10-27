@@ -49,6 +49,14 @@ pub struct ProxyConfig {
     pub shutdown_grace_secs: u64,
     /// Maximum concurrent WebSocket sessions per API key. `0` disables the cap.
     pub max_ws_connections_per_key: u32,
+    /// Close a WebSocket session after this many seconds with no frames in
+    /// either direction (pongs to the router's pings count). `0` disables the
+    /// idle timeout.
+    pub ws_idle_timeout_secs: u64,
+    /// Send a ping to the client this often so quiet but live subscriptions
+    /// stay open while dead peers stop answering and hit the idle timeout.
+    /// `0` disables pings. Must be shorter than `ws_idle_timeout_secs`.
+    pub ws_ping_interval_secs: u64,
     /// How a backend is chosen when no method route applies.
     pub selection: SelectionStrategy,
 }
@@ -75,6 +83,8 @@ impl Default for ProxyConfig {
             blocked_methods: Vec::new(),
             shutdown_grace_secs: 10,
             max_ws_connections_per_key: 100,
+            ws_idle_timeout_secs: 300,
+            ws_ping_interval_secs: 30,
             selection: SelectionStrategy::Weighted,
         }
     }
@@ -256,6 +266,15 @@ pub fn validate_config(
 
     if config.proxy.timeout_secs == 0 {
         return Err("Proxy timeout_secs must be > 0".into());
+    }
+    if config.proxy.ws_idle_timeout_secs != 0
+        && config.proxy.ws_ping_interval_secs >= config.proxy.ws_idle_timeout_secs
+    {
+        return Err(format!(
+            "proxy.ws_ping_interval_secs ({}) must be shorter than proxy.ws_idle_timeout_secs ({}), or the idle timeout fires between pings",
+            config.proxy.ws_ping_interval_secs, config.proxy.ws_idle_timeout_secs
+        )
+        .into());
     }
     if config.health_check.interval_secs == 0 {
         return Err("health_check.interval_secs must be > 0".into());
