@@ -202,8 +202,8 @@ async fn main() {
     }
 
     let http_app = http_router(state.clone());
-    let ws_app = ws_router(state);
-    let metrics_app = metrics_router(handle);
+    let ws_app = ws_router(state.clone());
+    let metrics_app = metrics_router(handle, state);
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let ws_port = config
@@ -230,6 +230,7 @@ async fn main() {
         metrics_addr
     );
     info!("Health endpoint: http://{}/health", http_addr);
+    info!("Detailed backend health: http://{}/health", metrics_addr);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {

@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Breaking:** the public `/health` on the main port now returns only an aggregate status, `{"status":"ok"}` (200) or `{"status":"unavailable"}` (503). Backend labels, counters, slots, latencies, `last_error` and the router version are no longer exposed on the RPC port.
+
+### Added
+- Detailed per-backend health (the previous `/health` body, unchanged) is served at `GET /health` on the metrics listener (`metrics_port`), next to `/metrics`. Point dashboards or scripts that read per-backend fields at that port.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
