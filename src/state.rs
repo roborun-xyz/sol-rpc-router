@@ -200,6 +200,20 @@ impl RouterState {
         }
     }
 
+    /// Builds the state for a hot reload: backends that keep their label carry
+    /// over their last known health (new ones start healthy), and health
+    /// entries for labels the new config no longer has are pruned.
+    pub fn reload_from_config(config: &Config, health_state: Arc<HealthState>) -> Self {
+        let state = Self::from_config(config, health_state.clone(), |label| {
+            health_state
+                .get_status(label)
+                .map(|s| s.healthy)
+                .unwrap_or(true)
+        });
+        health_state.retain_labels(config.backends.iter().map(|b| b.label.as_str()));
+        state
+    }
+
     /// Convenience constructor for tests and the in-process benchmark.
     pub fn simple(backends: Vec<RuntimeBackend>, health_state: Arc<HealthState>) -> Self {
         Self {

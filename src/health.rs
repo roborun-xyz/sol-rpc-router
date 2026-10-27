@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{atomic::Ordering, Arc, RwLock},
     time::SystemTime,
 };
@@ -75,6 +75,17 @@ impl HealthState {
             // If backend is new (hot reload), insert it
             statuses.insert(label.to_string(), status);
         }
+    }
+
+    /// Drops entries for labels not in `labels`, keeping the rest untouched.
+    /// Called after a hot reload so removed backends don't linger (and a
+    /// label re-added later starts fresh instead of inheriting stale state).
+    pub fn retain_labels<'a>(&self, labels: impl IntoIterator<Item = &'a str>) {
+        let keep: HashSet<&str> = labels.into_iter().collect();
+        self.statuses
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|label, _| keep.contains(label.as_str()));
     }
 
     pub fn get_all_statuses(&self) -> HashMap<String, BackendHealthStatus> {
@@ -233,6 +244,15 @@ pub async fn health_check_loop(client: HttpClient, router_state: Arc<ArcSwap<Rou
         let health_state = &current_state.health_state;
         let check_interval = Duration::from_secs(health_config.interval_secs);
 
+        // A pass that started before a hot reload may have written back a
+        // label the reload pruned; drop it again now that we see the new set.
+        health_state.retain_labels(
+            current_state
+                .backends
+                .iter()
+                .map(|b| b.config.label.as_str()),
+        );
+
         // Run all health checks concurrently so one slow backend doesn't block others
         let check_futures: Vec<_> = current_state
             .backends
@@ -373,6 +393,23 @@ mod tests {
         assert!(st.healthy);
         assert_eq!(st.slot, Some(101));
         assert!(st.last_error.is_none());
+    }
+
+    #[test]
+    fn retain_labels_prunes_only_missing_labels() {
+        let hs = HealthState::new(vec!["a".into(), "b".into(), "c".into()]);
+        hs.update_status(
+            "b",
+            BackendHealthStatus {
+                healthy: false,
+                ..Default::default()
+            },
+        );
+        hs.retain_labels(["b", "c", "new"]);
+        assert!(hs.get_status("a").is_none());
+        assert!(!hs.get_status("b").unwrap().healthy);
+        assert!(hs.get_status("c").is_some());
+        assert!(hs.get_status("new").is_none(), "retain never inserts");
     }
 
     #[test]

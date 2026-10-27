@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- SIGHUP reload now prunes health state for backends removed from the config, so their entries no longer accumulate and a label re-added later starts fresh instead of inheriting stale counters and `last_error`.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
