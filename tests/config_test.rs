@@ -693,3 +693,41 @@ selection = "fastest"
     );
     assert!(load_config(&path).is_err());
 }
+
+#[test]
+fn test_ws_idle_settings() {
+    let base = "port = 8080\nmetrics_port = 9091\nredis_url = \"redis://localhost\"\n\n[[backends]]\nlabel = \"b1\"\nurl = \"http://localhost:9000\"\nweight = 1\n\n";
+
+    let config = load_config(&write_temp_config("ws_idle_default", base)).unwrap();
+    assert_eq!(config.proxy.ws_idle_timeout_secs, 300);
+    assert_eq!(config.proxy.ws_ping_interval_secs, 30);
+
+    // 0 disables the idle timeout (pings may still run) or the pings.
+    for (name, body) in [
+        ("disabled", "[proxy]\nws_idle_timeout_secs = 0\n"),
+        (
+            "no_pings",
+            "[proxy]\nws_idle_timeout_secs = 60\nws_ping_interval_secs = 0\n",
+        ),
+    ] {
+        let path = write_temp_config(&format!("ws_idle_{}", name), &format!("{}{}", base, body));
+        load_config(&path).unwrap_or_else(|e| panic!("{}: {}", name, e));
+    }
+
+    for (name, body) in [
+        (
+            "ping_eq",
+            "[proxy]\nws_idle_timeout_secs = 30\nws_ping_interval_secs = 30\n",
+        ),
+        ("ping_gt", "[proxy]\nws_idle_timeout_secs = 10\n"),
+    ] {
+        let path = write_temp_config(&format!("ws_idle_{}", name), &format!("{}{}", base, body));
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("ws_ping_interval_secs"),
+            "{}: {}",
+            name,
+            err
+        );
+    }
+}

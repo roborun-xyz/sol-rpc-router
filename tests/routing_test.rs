@@ -396,3 +396,113 @@ fn test_all_backends_at_capacity_is_distinguishable_from_unhealthy() {
         "out of budget is not the same as unhealthy"
     );
 }
+
+fn reload_config(labels: &[&str]) -> sol_rpc_router::config::Config {
+    let mut toml = String::from("port = 8080\nmetrics_port = 9091\nredis_url = \"\"\n");
+    for label in labels {
+        toml.push_str(&format!(
+            "\n[[backends]]\nlabel = \"{label}\"\nurl = \"http://{label}\"\nweight = 1\n"
+        ));
+    }
+    toml::from_str(&toml).unwrap()
+}
+
+#[test]
+fn test_reload_prunes_health_of_removed_backends() {
+    let health_state = Arc::new(HealthState::new(vec![]));
+    let initial = RouterState::reload_from_config(
+        &reload_config(&["keep", "sick", "gone"]),
+        health_state.clone(),
+    );
+    assert_eq!(initial.backends.len(), 3);
+
+    for (label, healthy, err) in [
+        ("keep", true, None),
+        ("sick", false, Some("timeout")),
+        ("gone", false, Some("boom")),
+    ] {
+        health_state.update_status(
+            label,
+            BackendHealthStatus {
+                healthy,
+                consecutive_failures: if healthy { 0 } else { 3 },
+                last_error: err.map(String::from),
+                ..Default::default()
+            },
+        );
+    }
+
+    let reloaded =
+        RouterState::reload_from_config(&reload_config(&["keep", "sick"]), health_state.clone());
+
+    let old_health = health_state;
+    let health_state = reloaded.health_state.clone();
+
+    assert!(
+        health_state.get_status("gone").is_none(),
+        "removed backend's health entry must be pruned"
+    );
+    assert_eq!(health_state.get_all_statuses().len(), 2);
+
+    // Remaining backends keep their recorded status, and the lock-free flag
+    // the data path reads is seeded from it.
+    assert!(health_state.get_status("keep").unwrap().healthy);
+    let sick = health_state.get_status("sick").unwrap();
+    assert!(!sick.healthy);
+    assert_eq!(sick.consecutive_failures, 3);
+    assert_eq!(sick.last_error.as_deref(), Some("timeout"));
+    let flags: HashMap<_, _> = reloaded
+        .backends
+        .iter()
+        .map(|b| (b.config.label.as_str(), b.is_healthy()))
+        .collect();
+    assert_eq!(flags, HashMap::from([("keep", true), ("sick", false)]));
+
+    // A probe from the removed config finishes after reload. Neither a
+    // removed backend nor a retained backend may be overwritten by it.
+    for label in ["gone", "keep"] {
+        old_health.update_status(
+            label,
+            BackendHealthStatus {
+                healthy: false,
+                consecutive_failures: 99,
+                last_error: Some("stale probe".into()),
+                ..Default::default()
+            },
+        );
+    }
+    assert!(health_state.get_status("gone").is_none());
+    assert!(health_state.get_status("keep").unwrap().healthy);
+
+    // Re-adding the removed label starts fresh rather than inheriting stale state.
+    let readded = RouterState::reload_from_config(
+        &reload_config(&["keep", "sick", "gone"]),
+        health_state.clone(),
+    );
+    let gone = readded
+        .backends
+        .iter()
+        .find(|b| b.config.label == "gone")
+        .unwrap();
+    assert!(gone.is_healthy());
+    assert!(health_state.get_status("gone").is_none());
+
+    // Repeated reloads must use the latest generation's health history.
+    reloaded.health_state.update_status(
+        "keep",
+        BackendHealthStatus {
+            consecutive_successes: 7,
+            ..Default::default()
+        },
+    );
+    let again =
+        RouterState::reload_from_config(&reload_config(&["keep"]), reloaded.health_state.clone());
+    assert_eq!(
+        again
+            .health_state
+            .get_status("keep")
+            .unwrap()
+            .consecutive_successes,
+        7
+    );
+}

@@ -11,15 +11,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 - **Breaking:** the public `/health` on the main port now returns only an aggregate status, `{"status":"ok"}` (200) or `{"status":"unavailable"}` (503). Backend labels, counters, slots, latencies, `last_error` and the router version are no longer exposed on the RPC port.
+- `rpc-admin list` walks the key index with `SSCAN` and fetches each batch of key hashes in one pipeline instead of one round trip per key. Output is unchanged.
 
 ### Added
 - Detailed per-backend health (the previous `/health` body, unchanged) is served at `GET /health` on the metrics listener (`metrics_port`), next to `/metrics`. Point dashboards or scripts that read per-backend fields at that port.
 - `key_cache_ttl_secs` (default 60): how long the Redis keystore caches valid keys, i.e. how long `rpc-admin revoke`/`update` take to reach running routers. `0` disables the cache.
+- `rpc-admin list --limit/--offset` for paging (retains at most `offset + limit` rows plus distinct key identities for exact deduplication) and `--active-only` to hide revoked, expired and missing keys.
+- WebSocket idle timeout: `proxy.ws_idle_timeout_secs` (default 300, `0` disables) closes sessions with no frames received from either peer independently, sends a close frame to both peers, frees the per-key slot and counts `ws_connections_total{status="idle_timeout"}`. The router pings both peers every `proxy.ws_ping_interval_secs` (default 30, `0` disables) so live idle subscriptions stay open while dead or half-open peers are dropped. Config validation rejects a ping interval that is not shorter than the idle timeout.
 
 ### Fixed
 - Redis keystore: a cached key is rejected as soon as its `expires_at` passes instead of staying valid for up to 60 s.
 - Redis keystore: unknown keys are cached for 5 s instead of 60 s, so a newly created key starts working sooner on routers that had already rejected it.
 - Request body read failures are no longer all reported as 413: only a body over 10 MB is 413, a slow body is 408 and other read errors (client disconnect, malformed chunked encoding) are 400. New counter `rpc_body_read_errors_total{reason}` tells them apart.
+- SIGHUP reload now prunes health state for backends removed from the config, so their entries no longer accumulate and a label re-added later starts fresh instead of inheriting stale counters and `last_error`.
 
 ## [0.3.0] - 2026-10-10
 
