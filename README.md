@@ -117,6 +117,8 @@ flowchart LR
 
 `proxy.max_retries` (default `2`) caps the extra backends tried. A backend is never tried twice for one request. Method routes are honoured on the first attempt only.
 
+`proxy.timeout_secs` bounds each attempt end to end, response body included: a backend that sends headers and then stalls is a timeout like any other. To make that retryable, responses up to 10 MB are read in full before the router answers. Larger ones (declared or actual) are streamed so big `getProgramAccounts` replies still work; the same deadline applies to the rest of the body, but a stall there can only cut the response short, not fail over. Streamed attempts record their outcome and latency only when the body finishes, times out, fails, or is dropped by the client; a cancelled transfer is never counted as successful. Fan-out records each backend attempt independently.
+
 ### Selection strategies
 
 When no method route applies, a backend is picked at random among healthy backends with budget, in proportion to a weight:
@@ -158,7 +160,7 @@ weight = 1
 max_rps = 8                            # optional upstream budget (req/s); 0 or absent = unlimited
 
 [proxy]
-timeout_secs = 30                      # per attempt
+timeout_secs = 30                      # per attempt, headers and body
 max_retries = 2                        # extra backends to try on failure
 fanout_methods = ["sendTransaction"]
 blocked_methods = ["getProgramAccounts"]
@@ -287,7 +289,7 @@ Prometheus metrics (the `rpc_method` label is restricted to known Solana methods
 |---|---|---|
 | `rpc_requests_total` | counter | `method`, `status`, `rpc_method`, `backend`, `owner` |
 | `rpc_request_duration_seconds` | histogram | `rpc_method`, `backend`, `owner` |
-| `rpc_upstream_attempts_total` | counter | `backend`, `outcome` (`ok`, `upstream_status`, `retryable_status`, `timeout`, `transport_error`) |
+| `rpc_upstream_attempts_total` | counter | `backend`, `outcome` (`ok`, `upstream_status`, `retryable_status`, `timeout`, `transport_error`, `response_too_large`, `cancelled`) |
 | `rpc_failovers_total` | counter | `rpc_method` |
 | `rpc_fanout_total` | counter | `rpc_method`, `outcome` (`ok`, `failed`) |
 | `rpc_blocked_total` | counter | `rpc_method`, `owner` |

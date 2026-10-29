@@ -24,6 +24,7 @@ All notable changes to this project are documented here. The format follows
 - Redis keystore: unknown keys are cached for 5 s instead of 60 s, so a newly created key starts working sooner on routers that had already rejected it.
 - Request body read failures are no longer all reported as 413: only a body over 10 MB is 413, a slow body is 408 and other read errors (client disconnect, malformed chunked encoding) are 400. New counter `rpc_body_read_errors_total{reason}` tells them apart.
 - SIGHUP reload now prunes health state for backends removed from the config, so their entries no longer accumulate and a label re-added later starts fresh instead of inheriting stale counters and `last_error`.
+- `proxy.timeout_secs` now covers reading the upstream response body, not just the headers, on both the normal and fan-out paths. A buffered normal-path body stall times out (504 / -32095), is retried on another backend and counts as a `timeout` attempt. Responses up to 10 MB are buffered to make this possible; larger ones are streamed and aborted at the deadline. Streamed outcomes and latency are recorded at completion, error, timeout or cancellation, and fan-out records each backend attempt.
 
 ## [0.3.0] - 2026-10-10
 

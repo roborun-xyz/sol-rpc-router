@@ -36,7 +36,7 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// Per-attempt upstream timeout.
+    /// Per-attempt upstream timeout, covering the response headers and body.
     pub timeout_secs: u64,
     /// How many additional backends to try when an attempt fails with a
     /// connection error, timeout, HTTP 408/429 or 5xx. `0` disables failover.
