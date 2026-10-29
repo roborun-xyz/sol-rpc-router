@@ -414,7 +414,22 @@ pub async fn require_api_key(
 
 enum AttemptError {
     Timeout,
+    /// Full error chain, for server logs only. It can name the backend host,
+    /// resolver or TLS details, so it must never reach a client.
     Transport(String),
+}
+
+/// Formats an error with its whole `source()` chain; hyper-util's top-level
+/// message alone ("client error (Connect)") says little about the cause.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
 }
 
 async fn send_once(
@@ -424,7 +439,7 @@ async fn send_once(
 ) -> Result<hyper::Response<hyper::body::Incoming>, AttemptError> {
     match timeout(Duration::from_secs(timeout_secs), client.request(req)).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(AttemptError::Transport(e.to_string())),
+        Ok(Err(e)) => Err(AttemptError::Transport(error_chain(&e))),
         Err(_) => Err(AttemptError::Timeout),
     }
 }
@@ -625,11 +640,13 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
             );
             tag_response(resp, &label, &owner, attempts)
         }
-        Some((label, AttemptError::Transport(msg))) => {
+        Some((label, AttemptError::Transport(_))) => {
+            // The underlying error was logged per attempt above; clients get
+            // a generic message so backend hosts and network details stay private.
             let resp = rpc::error_response(
                 StatusCode::BAD_GATEWAY,
                 codes::UPSTREAM_ERROR,
-                format!("Upstream request failed: {} ({} attempt(s))", msg, attempts),
+                format!("Upstream request failed ({} attempt(s))", attempts),
                 rpc_id,
             );
             tag_response(resp, &label, &owner, attempts)
@@ -723,7 +740,7 @@ async fn fanout(
 
     let method_label = rpc::metric_label(method).to_string();
     let mut first_bad: Option<(String, StatusCode, Option<HeaderValue>, Bytes)> = None;
-    let mut first_failure: Option<(String, String)> = None;
+    let mut first_failure: Option<String> = None;
     let mut received = 0u32;
 
     while let Some((label, outcome)) = rx.recv().await {
@@ -749,7 +766,7 @@ async fn fanout(
             }
             FanoutOutcome::Failed(msg) => {
                 warn!("fanout {} backend={} failed: {}", method, label, msg);
-                first_failure.get_or_insert((label, msg));
+                first_failure.get_or_insert(label);
             }
         }
     }
@@ -765,11 +782,12 @@ async fn fanout(
             received,
         );
     }
-    let (label, msg) = first_failure.unwrap_or_else(|| ("none".to_string(), "no backends".into()));
+    // Failure details were logged above; keep them out of the client response.
+    let label = first_failure.unwrap_or_else(|| "none".to_string());
     let resp = rpc::error_response(
         StatusCode::BAD_GATEWAY,
         codes::UPSTREAM_ERROR,
-        format!("All {} backends failed: {}", total, msg),
+        format!("All {} backends failed", total),
         rpc_id,
     );
     tag_response(resp, &label, owner, received)

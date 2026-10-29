@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+- 502 responses no longer echo upstream transport errors (backend host, resolver, TLS or connection details) to clients; they now return a generic `Upstream request failed (N attempt(s))` / `All N backends failed` message. The full error chain is logged per attempt with the backend label.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added
