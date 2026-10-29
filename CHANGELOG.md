@@ -11,10 +11,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 - **Breaking:** the public `/health` on the main port now returns only an aggregate status, `{"status":"ok"}` (200) or `{"status":"unavailable"}` (503). Backend labels, counters, slots, latencies, `last_error` and the router version are no longer exposed on the RPC port.
+- `rpc-admin list` walks the key index with `SSCAN` and fetches each batch of key hashes in one pipeline instead of one round trip per key. Output is unchanged.
 
 ### Added
 - Detailed per-backend health (the previous `/health` body, unchanged) is served at `GET /health` on the metrics listener (`metrics_port`), next to `/metrics`. Point dashboards or scripts that read per-backend fields at that port.
 - `key_cache_ttl_secs` (default 60): how long the Redis keystore caches valid keys, i.e. how long `rpc-admin revoke`/`update` take to reach running routers. `0` disables the cache.
+- `rpc-admin list --limit/--offset` for paging (retains at most `offset + limit` rows plus distinct key identities for exact deduplication) and `--active-only` to hide revoked, expired and missing keys.
 
 ### Fixed
 - Redis keystore: a cached key is rejected as soon as its `expires_at` passes instead of staying valid for up to 60 s.
