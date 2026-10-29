@@ -35,6 +35,28 @@ weight = 1
 }
 
 #[test]
+fn test_key_cache_ttl_default_and_override() {
+    let base = r#"
+port = 8080
+metrics_port = 9091
+redis_url = "redis://localhost"
+
+[[backends]]
+label = "b1"
+url = "http://localhost:9000"
+weight = 1
+"#;
+    let path = write_temp_config("key_cache_default", base);
+    assert_eq!(load_config(&path).unwrap().key_cache_ttl_secs, 60);
+
+    let path = write_temp_config(
+        "key_cache_override",
+        &format!("key_cache_ttl_secs = 5\n{}", base),
+    );
+    assert_eq!(load_config(&path).unwrap().key_cache_ttl_secs, 5);
+}
+
+#[test]
 fn test_load_config_file_not_found() {
     let mut path = std::env::temp_dir();
     path.push("sol_rpc_router_nonexistent_config.toml");

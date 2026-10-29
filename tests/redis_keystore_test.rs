@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redis::AsyncCommands;
 use sol_rpc_router::keystore::{
-    KeyStore, KeyStoreError, RedisKeyStore, KEY_PREFIX, RATE_LIMIT_PREFIX,
+    KeyStore, KeyStoreError, RedisKeyStore, KEY_PREFIX, NEGATIVE_KEY_CACHE_TTL, RATE_LIMIT_PREFIX,
 };
 
 fn redis_url() -> Option<String> {
@@ -133,8 +133,42 @@ async fn redis_keystore_end_to_end() {
     .await;
     assert!(store.validate_key(&fresh).await.unwrap().is_some());
 
+    // A cached key stops working when its expiry passes, not when the cache
+    // entry would have expired.
+    let expiring = unique("expiring");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    seed(
+        &mut con,
+        &expiring,
+        &[
+            ("owner", "frank".into()),
+            ("expires_at", (now + 2).to_string()),
+        ],
+    )
+    .await;
+    assert!(store.validate_key(&expiring).await.unwrap().is_some());
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(store.validate_key(&expiring).await.unwrap(), None);
+
+    // A key created after a cached miss works once the short negative entry
+    // lapses, well before the positive TTL.
+    let late = unique("late");
+    assert_eq!(store.validate_key(&late).await.unwrap(), None);
+    seed(&mut con, &late, &[("owner", "gina".into())]).await;
+    assert_eq!(store.validate_key(&late).await.unwrap(), None);
+    tokio::time::sleep(NEGATIVE_KEY_CACHE_TTL + Duration::from_millis(200)).await;
+    assert_eq!(
+        store.validate_key(&late).await.unwrap().unwrap().owner,
+        "gina"
+    );
+
     // Cleanup.
-    for k in [&limited, &unlimited, &revoked, &expired, &fresh] {
+    for k in [
+        &limited, &unlimited, &revoked, &expired, &fresh, &expiring, &late,
+    ] {
         let _: () = con.del(format!("{}{}", KEY_PREFIX, k)).await.unwrap();
         let _: () = con
             .del(format!("{}{}", RATE_LIMIT_PREFIX, k))

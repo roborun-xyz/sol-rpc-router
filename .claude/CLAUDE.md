@@ -39,7 +39,8 @@ src/
   state.rs          RouterState (backends, routes, fanout/blocked sets), select_backend()
   router.rs         http_router()/ws_router()/metrics_router(): the ONE place middleware order
                     is defined; binary, benchmark and tests all use it
-  handlers.rs       Axum handlers: proxy (retry + fan-out), ws_proxy, health_endpoint
+  handlers.rs       Axum handlers: proxy (retry + fan-out), ws_proxy, health_endpoint (public,
+                    aggregate only), health_details_endpoint (metrics listener)
                     Middleware: request_id, require_api_key, extract_rpc_method, log_requests,
                     track_metrics
   upstream.rs       build_uri() (merges backend query strings), forwardable_headers(),
@@ -56,7 +57,7 @@ src/
 
 tests/
   config_test.rs          Config validation paths (incl. keystore selection)
-  handler_test.rs         Proxy errors, health endpoint, extract_rpc_method middleware
+  handler_test.rs         Proxy errors, public + detailed health endpoints, extract_rpc_method middleware
   proxy_features_test.rs  Header auth, credential stripping, failover, fan-out, blocked
                           methods, batches, request ids, sub-path forwarding
   ws_test.rs              End-to-end WebSocket relay through a real TCP listener
@@ -78,7 +79,7 @@ tests/
 - **Proxy flow**: auth → blocked check → fan-out (if method listed) → retry loop via `RouterState::select_backend(method, &tried)`. Retryable = transport error, timeout, 408/429/5xx. Non-retryable upstream statuses pass through untouched.
 - **Fan-out**: sends are `tokio::spawn`ed and results arrive over an mpsc channel, so dropping the receiver after the first success does not cancel the remaining sends.
 - **Errors**: router-generated errors go through `rpc::error_response()` (JSON-RPC body with the request id). Keep HTTP status codes stable; tests assert on them.
-- **Health**: probe decisions live in the pure `health::apply_probe()` (unit-tested); the loop only does I/O and logging. `HealthState` (`RwLock<HashMap>`) is the detailed record and what `/health` reports; `RuntimeBackend.healthy` (`AtomicBool`) is the lock-free flag the data path reads. The health loop updates both. Backends default to healthy.
+- **Health**: probe decisions live in the pure `health::apply_probe()` (unit-tested); the loop only does I/O and logging. `HealthState` (`RwLock<HashMap>`) is the detailed record and what the metrics listener's `/health` reports (the public `/health` on the main port returns only `{"status":"ok"|"unavailable"}`; never add backend details to it); `RuntimeBackend.healthy` (`AtomicBool`) is the lock-free flag the data path reads. The health loop updates both. Backends default to healthy.
 - **Metrics**: use `rpc::metric_label()` for any `rpc_method` label to keep cardinality bounded.
 - **Tests**: use `tower::ServiceExt::oneshot()` on routers; bind real listeners only when `ConnectInfo` or a WS client is needed.
 

@@ -113,24 +113,9 @@ fn new_request_id() -> String {
 /// body back so the handler can forward it.
 pub async fn extract_rpc_method(req: Request<Body>, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
-    let body_bytes = match timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_BODY_SIZE)).await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => {
-            return rpc::error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                codes::INVALID_REQUEST,
-                "Request body too large",
-                None,
-            );
-        }
-        Err(_) => {
-            return rpc::error_response(
-                StatusCode::REQUEST_TIMEOUT,
-                codes::INVALID_REQUEST,
-                "Timed out reading request body",
-                None,
-            );
-        }
+    let body_bytes = match read_body(body).await {
+        Ok(bytes) => bytes,
+        Err(e) => return e.into_response(None),
     };
 
     if let Some(info) = rpc::probe_request(&body_bytes) {
@@ -140,6 +125,66 @@ pub async fn extract_rpc_method(req: Request<Body>, next: Next) -> Response {
 
     next.run(Request::from_parts(parts, Body::from(body_bytes)))
         .await
+}
+
+/// Why a request body could not be read. Only a size-limit breach is a 413;
+/// slow clients get a 408 and everything else (client disconnect, malformed
+/// chunked encoding, ...) a 400.
+#[derive(Debug)]
+enum BodyReadError {
+    TooLarge,
+    Timeout,
+    Failed(axum::Error),
+}
+
+impl BodyReadError {
+    fn reason(&self) -> &'static str {
+        match self {
+            BodyReadError::TooLarge => "too_large",
+            BodyReadError::Timeout => "timeout",
+            BodyReadError::Failed(_) => "read_error",
+        }
+    }
+
+    fn into_response(self, id: Option<&Value>) -> Response {
+        let reason = self.reason();
+        counter!("rpc_body_read_errors_total", "reason" => reason).increment(1);
+        let (status, message) = match &self {
+            BodyReadError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large"),
+            BodyReadError::Timeout => (
+                StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+            ),
+            BodyReadError::Failed(e) => {
+                warn!("Failed to read request body: reason={} error={}", reason, e);
+                (StatusCode::BAD_REQUEST, "Failed to read request body")
+            }
+        };
+        rpc::error_response(status, codes::INVALID_REQUEST, message, id)
+    }
+}
+
+/// Buffers a request body, enforcing `MAX_BODY_SIZE` and `BODY_READ_TIMEOUT`.
+async fn read_body(body: Body) -> Result<Bytes, BodyReadError> {
+    match timeout(BODY_READ_TIMEOUT, to_bytes(body, MAX_BODY_SIZE)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) if is_length_limit_error(&e) => Err(BodyReadError::TooLarge),
+        Ok(Err(e)) => Err(BodyReadError::Failed(e)),
+        Err(_) => Err(BodyReadError::Timeout),
+    }
+}
+
+/// `to_bytes` reports a size-limit breach as an `http_body_util::LengthLimitError`
+/// somewhere in the error's source chain.
+fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 pub async fn log_requests(
@@ -487,17 +532,9 @@ pub async fn proxy(State(state): State<Arc<AppState>>, req: Request<Body>) -> Re
         }
     }
 
-    let body_bytes = match to_bytes(body, MAX_BODY_SIZE).await {
+    let body_bytes = match read_body(body).await {
         Ok(b) => b,
-        Err(_) => {
-            let resp = rpc::error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                codes::INVALID_REQUEST,
-                "Request body too large",
-                rpc_id,
-            );
-            return tag_response(resp, "none", &owner, 0);
-        }
+        Err(e) => return tag_response(e.into_response(rpc_id), "none", &owner, 0),
     };
 
     let path = parts.uri.path().to_string();
@@ -803,9 +840,19 @@ fn bytes_response(status: StatusCode, content_type: Option<HeaderValue>, bytes: 
 }
 
 // ---------------------------------------------------------------------------
-// Health endpoint
+// Health endpoints
 // ---------------------------------------------------------------------------
 
+/// Body of the public `/health` on the main listener. Deliberately carries no
+/// backend labels, counters or probe errors: anyone who can reach the RPC port
+/// can call it, so it only says whether the router can serve traffic.
+#[derive(Serialize)]
+pub struct PublicHealthResponse {
+    /// `"ok"` when at least one backend is healthy, `"unavailable"` otherwise.
+    pub status: &'static str,
+}
+
+/// Body of the detailed `/health` on the metrics listener.
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub overall_status: String,
@@ -833,7 +880,42 @@ pub struct BackendHealth {
     pub last_error: Option<String>,
 }
 
+fn health_http_status(healthy_count: usize) -> StatusCode {
+    if healthy_count > 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// Public liveness probe for load balancers: aggregate status only.
 pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
+    let current_state = state.state.load();
+    let healthy_count = current_state
+        .backends
+        .iter()
+        .filter(|b| {
+            current_state
+                .health_state
+                .get_status(&b.config.label)
+                .unwrap_or_default()
+                .healthy
+        })
+        .count();
+
+    let body = PublicHealthResponse {
+        status: if healthy_count > 0 {
+            "ok"
+        } else {
+            "unavailable"
+        },
+    };
+    (health_http_status(healthy_count), Json(body)).into_response()
+}
+
+/// Per-backend health report. Served on the metrics listener only, because
+/// labels and raw probe errors reveal the upstream setup.
+pub async fn health_details_endpoint(State(state): State<Arc<AppState>>) -> Response {
     let current_state = state.state.load();
     let all_statuses = current_state.health_state.get_all_statuses();
     let now = SystemTime::now();
@@ -883,11 +965,6 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
     } else {
         "unhealthy"
     };
-    let http_status = if healthy_count > 0 {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
 
     let body = HealthResponse {
         overall_status: overall_status.to_string(),
@@ -897,7 +974,7 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
         backends,
     };
 
-    (http_status, Json(body)).into_response()
+    (health_http_status(healthy_count), Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------
