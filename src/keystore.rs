@@ -1,19 +1,24 @@
 use std::{
     collections::HashMap,
     sync::LazyLock,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use moka::future::Cache;
+use moka::{future::Cache, Expiry};
 use redis::{aio::ConnectionManager, Client, Script};
 
 use crate::config::ApiKeyConfig;
 
-/// How long key metadata is cached locally. Revocations and rate-limit
-/// changes take up to this long to propagate to a running router.
+/// Default for how long a valid key is cached locally (`key_cache_ttl_secs`).
+/// Revocations and rate-limit changes take up to this long to propagate to a
+/// running router. Entries for keys with an `expires_at` never outlive it.
 pub const KEY_CACHE_TTL: Duration = Duration::from_secs(60);
+/// How long an unknown, inactive or expired key is cached, so a key looked up
+/// just before `rpc-admin create` starts working within this window. Capped
+/// at the positive TTL.
+pub const NEGATIVE_KEY_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Upper bound on cached key lookups (hits and misses). Bounds memory when a
 /// client sprays random keys.
@@ -75,29 +80,101 @@ static RATE_LIMIT_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
     )
 });
 
+/// A valid key as cached by `KeyCache`, with the expiry it was read with.
+#[derive(Clone, Debug)]
+struct CachedKey {
+    info: KeyInfo,
+    /// Unix seconds; `0` means never.
+    expires_at: u64,
+}
+
+/// Per-entry TTL: `positive_ttl` for valid keys, cut short at their
+/// `expires_at`; `NEGATIVE_KEY_CACHE_TTL` (at most `positive_ttl`) for misses.
+fn entry_ttl(entry: Option<&CachedKey>, positive_ttl: Duration, now: u64) -> Duration {
+    match entry {
+        None => NEGATIVE_KEY_CACHE_TTL.min(positive_ttl),
+        Some(k) if k.expires_at == 0 => positive_ttl,
+        Some(k) => Duration::from_secs(k.expires_at.saturating_sub(now)).min(positive_ttl),
+    }
+}
+
+struct KeyCacheExpiry {
+    positive_ttl: Duration,
+}
+
+impl Expiry<String, Option<CachedKey>> for KeyCacheExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &Option<CachedKey>,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        Some(entry_ttl(value.as_ref(), self.positive_ttl, now_unix()))
+    }
+}
+
+/// Bounded local cache of Redis key lookups (hits and misses).
+struct KeyCache {
+    cache: Cache<String, Option<CachedKey>>,
+}
+
+impl KeyCache {
+    fn new(positive_ttl: Duration) -> Self {
+        let cache = Cache::builder()
+            .expire_after(KeyCacheExpiry { positive_ttl })
+            .max_capacity(KEY_CACHE_CAPACITY)
+            .build();
+        Self { cache }
+    }
+
+    /// `None` on a cache miss. A cached key whose `expires_at` has passed is
+    /// reported invalid even if its entry has not been evicted yet.
+    async fn get(&self, key: &str, now: u64) -> Option<Option<KeyInfo>> {
+        let entry = self.cache.get(key).await?;
+        Some(entry.and_then(|k| {
+            if k.expires_at != 0 && k.expires_at <= now {
+                None
+            } else {
+                Some(k.info)
+            }
+        }))
+    }
+
+    async fn insert(&self, key: &str, entry: Option<CachedKey>) {
+        self.cache.insert(key.to_string(), entry).await;
+    }
+}
+
 pub struct RedisKeyStore {
     conn: ConnectionManager,
-    cache: Cache<String, Option<KeyInfo>>,
+    cache: KeyCache,
 }
 
 impl RedisKeyStore {
     pub async fn new(redis_url: &str) -> Result<Self, KeyStoreError> {
+        Self::with_cache_ttl(redis_url, KEY_CACHE_TTL).await
+    }
+
+    /// Like `new`, caching valid keys for `cache_ttl` (`key_cache_ttl_secs`).
+    /// `Duration::ZERO` disables the cache.
+    pub async fn with_cache_ttl(
+        redis_url: &str,
+        cache_ttl: Duration,
+    ) -> Result<Self, KeyStoreError> {
         let client = Client::open(redis_url).map_err(|e| KeyStoreError::Backend(e.to_string()))?;
         let conn = client
             .get_connection_manager()
             .await
             .map_err(|e| KeyStoreError::Backend(e.to_string()))?;
 
-        let cache = Cache::builder()
-            .time_to_live(KEY_CACHE_TTL)
-            .max_capacity(KEY_CACHE_CAPACITY)
-            .build();
-
-        Ok(Self { conn, cache })
+        Ok(Self {
+            conn,
+            cache: KeyCache::new(cache_ttl),
+        })
     }
 
     async fn get_key_info(&self, key: &str) -> Result<Option<KeyInfo>, KeyStoreError> {
-        if let Some(info) = self.cache.get(key).await {
+        if let Some(info) = self.cache.get(key, now_unix()).await {
             return Ok(info);
         }
 
@@ -112,7 +189,11 @@ impl RedisKeyStore {
             .map_err(|e| KeyStoreError::Backend(e.to_string()))?;
 
         let info = parse_key_fields(&fields, now_unix());
-        self.cache.insert(key.to_string(), info.clone()).await;
+        let entry = info.clone().map(|info| CachedKey {
+            info,
+            expires_at: parse_expires_at(&fields),
+        });
+        self.cache.insert(key, entry).await;
         Ok(info)
     }
 
@@ -150,10 +231,9 @@ pub fn parse_key_fields(fields: &HashMap<String, String>, now: u64) -> Option<Ke
         return None;
     }
 
-    if let Some(exp) = fields.get("expires_at").and_then(|v| v.parse::<u64>().ok()) {
-        if exp != 0 && exp <= now {
-            return None;
-        }
+    let exp = parse_expires_at(fields);
+    if exp != 0 && exp <= now {
+        return None;
     }
 
     let rate_limit = fields
@@ -162,6 +242,14 @@ pub fn parse_key_fields(fields: &HashMap<String, String>, now: u64) -> Option<Ke
         .unwrap_or(0);
 
     Some(KeyInfo { owner, rate_limit })
+}
+
+/// `expires_at` from an `api_key:*` hash; `0` (never) when absent or garbage.
+fn parse_expires_at(fields: &HashMap<String, String>) -> u64 {
+    fields
+        .get("expires_at")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -425,5 +513,63 @@ mod tests {
     fn garbage_rate_limit_means_unlimited() {
         let f = fields(&[("owner", "alice"), ("rate_limit", "lots")]);
         assert_eq!(parse_key_fields(&f, 1).unwrap().rate_limit, 0);
+    }
+
+    fn cached(owner: &str, expires_at: u64) -> CachedKey {
+        CachedKey {
+            info: KeyInfo {
+                owner: owner.into(),
+                rate_limit: 0,
+            },
+            expires_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_hit_rejects_key_once_expires_at_passes() {
+        // Entry TTLs run on the real clock; `get` takes `now` explicitly.
+        let now = now_unix();
+        let cache = KeyCache::new(KEY_CACHE_TTL);
+        cache.insert("k", Some(cached("alice", now + 30))).await;
+        let hit = cache.get("k", now + 29).await;
+        assert_eq!(hit.unwrap().unwrap().owner, "alice");
+        // Still cached (its TTL is ~30 s away), but no longer valid.
+        assert_eq!(cache.get("k", now + 30).await, Some(None));
+        assert_eq!(cache.get("k", now + 31).await, Some(None));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_without_expiry_stays_valid() {
+        let cache = KeyCache::new(KEY_CACHE_TTL);
+        cache.insert("k", Some(cached("alice", 0))).await;
+        assert!(cache.get("k", u64::MAX).await.unwrap().is_some());
+        cache.insert("missing", None).await;
+        assert_eq!(cache.get("missing", 1).await, Some(None));
+        assert_eq!(cache.get("other", 1).await, None);
+    }
+
+    #[test]
+    fn negative_entries_expire_sooner_than_positive_ones() {
+        assert!(NEGATIVE_KEY_CACHE_TTL < KEY_CACHE_TTL);
+        assert_eq!(entry_ttl(None, KEY_CACHE_TTL, 0), NEGATIVE_KEY_CACHE_TTL);
+        assert_eq!(
+            entry_ttl(Some(&cached("a", 0)), KEY_CACHE_TTL, 0),
+            KEY_CACHE_TTL
+        );
+        // A shorter configured TTL also caps negative entries.
+        let short = Duration::from_secs(2);
+        assert_eq!(entry_ttl(None, short, 0), short);
+        assert_eq!(entry_ttl(None, Duration::ZERO, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn positive_ttl_is_capped_at_expiry() {
+        let ttl = KEY_CACHE_TTL;
+        assert_eq!(
+            entry_ttl(Some(&cached("a", 110)), ttl, 100),
+            Duration::from_secs(10)
+        );
+        assert_eq!(entry_ttl(Some(&cached("a", 10_000)), ttl, 100), ttl);
+        assert_eq!(entry_ttl(Some(&cached("a", 50)), ttl, 100), Duration::ZERO);
     }
 }

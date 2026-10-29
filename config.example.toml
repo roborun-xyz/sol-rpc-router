@@ -8,6 +8,8 @@ metrics_port = 28901     # Prometheus metrics, keep this one off the public inte
 #  - Redis (below): keys managed with `rpc-admin`, limits shared across router instances.
 #  - Config file: leave redis_url empty and list keys under [[api_keys]]; reload with SIGHUP.
 redis_url = "redis://127.0.0.1:6379/0"   # Overridable with the REDIS_URL env var.
+# key_cache_ttl_secs = 60                # Redis only: how long valid keys are cached, i.e. how long a
+                                         # revoke/update takes to apply. 0 = no cache. Unknown keys: 5 s.
 
 # [[api_keys]]
 # key = "replace-with-a-long-random-string"

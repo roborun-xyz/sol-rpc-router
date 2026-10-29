@@ -113,9 +113,14 @@ async fn main() {
             );
             fks.clone()
         }
-        None => match RedisKeyStore::new(&config.redis_url).await {
+        None => match RedisKeyStore::with_cache_ttl(
+            &config.redis_url,
+            Duration::from_secs(config.key_cache_ttl_secs),
+        )
+        .await
+        {
             Ok(ks) => {
-                info!("Keystore: Redis");
+                info!("Keystore: Redis (key cache {}s)", config.key_cache_ttl_secs);
                 Arc::new(ks)
             }
             Err(e) => {
@@ -148,8 +153,12 @@ async fn main() {
         let health_state = health_state.clone();
         let config_path = args.config.clone();
         let file_keystore = file_keystore.clone();
-        let (boot_port, boot_metrics_port, boot_redis) =
-            (config.port, config.metrics_port, config.redis_url.clone());
+        let (boot_port, boot_metrics_port, boot_redis, boot_cache_ttl) = (
+            config.port,
+            config.metrics_port,
+            config.redis_url.clone(),
+            config.key_cache_ttl_secs,
+        );
         tokio::spawn(async move {
             let mut sighup =
                 signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
@@ -164,9 +173,10 @@ async fn main() {
                         if new_config.port != boot_port
                             || new_config.metrics_port != boot_metrics_port
                             || new_config.redis_url != boot_redis
+                            || new_config.key_cache_ttl_secs != boot_cache_ttl
                         {
                             warn!(
-                                "port, metrics_port and redis_url changed in the file but only apply after a restart"
+                                "port, metrics_port, redis_url and key_cache_ttl_secs changed in the file but only apply after a restart"
                             );
                         }
                         let new_state =

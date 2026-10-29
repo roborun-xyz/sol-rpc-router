@@ -14,6 +14,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - Detailed per-backend health (the previous `/health` body, unchanged) is served at `GET /health` on the metrics listener (`metrics_port`), next to `/metrics`. Point dashboards or scripts that read per-backend fields at that port.
+- `key_cache_ttl_secs` (default 60): how long the Redis keystore caches valid keys, i.e. how long `rpc-admin revoke`/`update` take to reach running routers. `0` disables the cache.
+
+### Fixed
+- Redis keystore: a cached key is rejected as soon as its `expires_at` passes instead of staying valid for up to 60 s.
+- Redis keystore: unknown keys are cached for 5 s instead of 60 s, so a newly created key starts working sooner on routers that had already rejected it.
 
 ## [0.3.0] - 2026-10-10
 
