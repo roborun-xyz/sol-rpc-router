@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use sol_rpc_router::{
-    config::Backend,
+    config::{Backend, ProxyConfig},
     health::HealthState,
     mock::MockKeyStore,
     router::ws_router,
@@ -43,14 +43,22 @@ async fn start_echo_backend() -> String {
 }
 
 async fn start_router(ws_url: Option<String>, healthy: bool) -> SocketAddr {
-    start_router_inner(ws_url, healthy, 0).await
+    start_router_inner(ws_url, healthy, |p| p.max_ws_connections_per_key = 0)
+        .await
+        .0
 }
 
 async fn start_router_with_cap(ws_url: Option<String>, cap: u32) -> SocketAddr {
-    start_router_inner(ws_url, true, cap).await
+    start_router_inner(ws_url, true, |p| p.max_ws_connections_per_key = cap)
+        .await
+        .0
 }
 
-async fn start_router_inner(ws_url: Option<String>, healthy: bool, cap: u32) -> SocketAddr {
+async fn start_router_inner(
+    ws_url: Option<String>,
+    healthy: bool,
+    configure: impl FnOnce(&mut ProxyConfig),
+) -> (SocketAddr, Arc<AppState>) {
     let https = HttpsConnector::new();
     let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build(https);
     let keystore = Arc::new(MockKeyStore::new());
@@ -68,14 +76,14 @@ async fn start_router_inner(ws_url: Option<String>, healthy: bool, cap: u32) -> 
     );
     let health_state = Arc::new(HealthState::new(vec!["echo".into()]));
     let mut router_state = RouterState::simple(vec![backend], health_state);
-    router_state.proxy.max_ws_connections_per_key = cap;
+    configure(&mut router_state.proxy);
     let state = Arc::new(AppState::new(
         client,
         keystore,
         Arc::new(ArcSwap::from_pointee(router_state)),
     ));
 
-    let app = ws_router(state);
+    let app = ws_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -86,7 +94,7 @@ async fn start_router_inner(ws_url: Option<String>, healthy: bool, cap: u32) -> 
         .await
         .unwrap();
     });
-    addr
+    (addr, state)
 }
 
 #[tokio::test]
@@ -186,4 +194,181 @@ async fn ws_per_key_connection_cap() {
     drop(_a);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let (_c, _) = connect_async(&url).await.expect("slot freed");
+}
+
+/// Reads frames until the router closes the session, returning the close
+/// frame. Reading also lets the client auto-reply to pings.
+async fn read_until_close(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<tokio_tungstenite::tungstenite::protocol::CloseFrame<'static>> {
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(Message::Close(frame)) => return frame,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+async fn wait_for_slot_release(state: &AppState) {
+    for _ in 0..50 {
+        if state.ws_session_count("ws-tester") == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "slot not released, count={}",
+        state.ws_session_count("ws-tester")
+    );
+}
+
+#[tokio::test]
+async fn ws_idle_session_is_closed_and_slot_freed() {
+    let backend = start_echo_backend().await;
+    let (router, state) = start_router_inner(Some(backend), true, |p| {
+        p.max_ws_connections_per_key = 1;
+        p.ws_idle_timeout_secs = 1;
+        p.ws_ping_interval_secs = 0;
+    })
+    .await;
+    let url = format!("ws://{}/?api-key=ws-key", router);
+
+    let (mut ws, _) = connect_async(&url).await.expect("upgrade");
+    // Activity before going quiet is relayed as usual.
+    ws.send(Message::Text("hi".into())).await.unwrap();
+    assert_eq!(
+        ws.next().await.unwrap().unwrap().into_text().unwrap(),
+        "echo:hi"
+    );
+    assert_eq!(state.ws_session_count("ws-tester"), 1);
+
+    let started = std::time::Instant::now();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), read_until_close(&mut ws))
+        .await
+        .expect("router closes the idle session")
+        .expect("close frame");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+    assert_eq!(frame.reason, "idle timeout");
+
+    wait_for_slot_release(&state).await;
+    // The single slot is usable again.
+    let (_again, _) = connect_async(&url).await.expect("slot freed");
+}
+
+#[tokio::test]
+async fn ws_pings_keep_live_idle_client_open() {
+    let backend = start_echo_backend().await;
+    let (router, state) = start_router_inner(Some(backend), true, |p| {
+        p.ws_idle_timeout_secs = 2;
+        p.ws_ping_interval_secs = 1;
+    })
+    .await;
+
+    let (mut ws, _) = connect_async(format!("ws://{}/?api-key=ws-key", router))
+        .await
+        .expect("upgrade");
+
+    // Stay quiet for longer than the idle timeout, only answering pings.
+    let mut pings = 0;
+    let quiet = tokio::time::sleep(std::time::Duration::from_millis(3500));
+    tokio::pin!(quiet);
+    loop {
+        tokio::select! {
+            _ = &mut quiet => break,
+            msg = ws.next() => match msg {
+                Some(Ok(Message::Ping(_))) => pings += 1,
+                other => panic!("unexpected frame while idle: {:?}", other),
+            },
+        }
+    }
+    assert!(pings >= 2, "expected router pings, got {}", pings);
+    assert_eq!(state.ws_session_count("ws-tester"), 1);
+
+    ws.send(Message::Text("still here".into())).await.unwrap();
+    let reply = loop {
+        match ws.next().await.unwrap().unwrap() {
+            Message::Ping(_) => continue,
+            other => break other,
+        }
+    };
+    assert_eq!(reply.into_text().unwrap(), "echo:still here");
+}
+
+#[tokio::test]
+async fn ws_unresponsive_client_is_closed_despite_pings() {
+    let backend = start_echo_backend().await;
+    let (router, state) = start_router_inner(Some(backend), true, |p| {
+        p.ws_idle_timeout_secs = 2;
+        p.ws_ping_interval_secs = 1;
+    })
+    .await;
+
+    // Never polling the stream means the client never sends pongs.
+    let (_ws, _) = connect_async(format!("ws://{}/?api-key=ws-key", router))
+        .await
+        .expect("upgrade");
+    assert_eq!(state.ws_session_count("ws-tester"), 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    wait_for_slot_release(&state).await;
+}
+
+#[tokio::test]
+async fn ws_dead_backend_is_closed_despite_live_client_pongs() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let ws = accept_async(tcp).await.unwrap();
+        std::future::pending::<()>().await;
+        drop(ws);
+    });
+    let (router, state) = start_router_inner(Some(format!("ws://{backend_addr}")), true, |p| {
+        p.ws_idle_timeout_secs = 2;
+        p.ws_ping_interval_secs = 1;
+        p.max_ws_connections_per_key = 1;
+    })
+    .await;
+    let (mut ws, _) = connect_async(format!("ws://{router}/?api-key=ws-key"))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), read_until_close(&mut ws))
+        .await
+        .expect("dead backend must time out even while the client answers pings")
+        .expect("close frame");
+    assert_eq!(frame.reason, "idle timeout");
+    wait_for_slot_release(&state).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_dead_client_is_closed_despite_active_backend() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(tcp).await.unwrap();
+        loop {
+            if ws.send(Message::Text("notification".into())).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+    let (router, state) = start_router_inner(Some(format!("ws://{addr}")), true, |p| {
+        p.ws_idle_timeout_secs = 2;
+        p.ws_ping_interval_secs = 1;
+    })
+    .await;
+    // Never reading means this client does not answer the router's pings.
+    let (_ws, _) = connect_async(format!("ws://{router}/?api-key=ws-key"))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    wait_for_slot_release(&state).await;
+    server.abort();
 }

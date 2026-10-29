@@ -164,6 +164,8 @@ fanout_methods = ["sendTransaction"]
 blocked_methods = ["getProgramAccounts"]
 shutdown_grace_secs = 10               # drain time after SIGTERM
 max_ws_connections_per_key = 100       # concurrent WebSocket sessions per key, 0 = unlimited
+ws_idle_timeout_secs = 300             # close WebSocket sessions idle this long (either peer silent), 0 = never
+ws_ping_interval_secs = 30             # ping both peers so live idle subscriptions stay open, 0 = no pings
 selection = "weighted"                 # or "latency_weighted" (see Selection strategies)
 
 [health_check]
@@ -296,7 +298,7 @@ Prometheus metrics (the `rpc_method` label is restricted to known Solana methods
 | `rpc_backend_slot_lag` | gauge | `backend` (slots behind the best backend) |
 | `rpc_backend_health_check_duration_seconds` | histogram | `backend` |
 | `rpc_backend_request_latency_ewma_seconds` | gauge | `backend` |
-| `ws_connections_total` | counter | `backend`, `owner`, `status` |
+| `ws_connections_total` | counter | `backend`, `owner`, `status` (`idle_timeout` when a session is closed for inactivity) |
 | `ws_active_connections` | gauge | `backend`, `owner` |
 | `ws_messages_total` | counter | `backend`, `owner`, `direction` |
 | `ws_connection_duration_seconds` | histogram | `backend`, `owner` |
@@ -312,7 +314,7 @@ Request logs are one line per request with method, status, duration, backend, ow
 - Do not expose `metrics_port` publicly: it serves `/metrics` and the detailed `/health`, both of which name every backend.
 - Expose `port` (and `port+1` if you want the dedicated WS listener). Keep `metrics_port` and Redis private.
 - Run as many router instances as you like against one Redis; rate limits stay consistent. With the file keystore each instance limits independently.
-- Authentication runs before the request body is read, bodies are capped at 10 MB with a 10 s read timeout, key lookups are cached in a bounded cache, and WebSocket sessions are capped per key.
+- Authentication runs before the request body is read, bodies are capped at 10 MB with a 10 s read timeout, key lookups are cached in a bounded cache, WebSocket sessions are capped per key. A session with no frames received from either peer independently for `ws_idle_timeout_secs` is closed (code 1000, reason `idle timeout`) and its slot released; the router pings both peers every `ws_ping_interval_secs`, so live peers that answer pings stay connected while a silent client or backend is dropped independently. The ping interval must be shorter than the idle timeout.
 - `SIGTERM` stops accepting connections, drains in-flight requests for `shutdown_grace_secs`, then exits. Long-lived WebSocket sessions are cut at the deadline.
 - CPU needs are small: with the benchmark process pinned to one tokio worker thread (router, mock upstream and load generator all sharing it) it still does about 28k req/s.
 

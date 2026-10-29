@@ -41,6 +41,8 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 /// replies are tiny, so this is generous.
 const MAX_FANOUT_RESPONSE_SIZE: usize = 1024 * 1024;
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on sending close frames when an idle session is torn down.
+const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Slow-body clients are cut off after this long.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1035,12 +1037,44 @@ pub async fn ws_proxy(
         addr, backend_label, owner
     );
 
+    let idle = WsIdleConfig::from_proxy(&state.state.load().proxy);
+
     ws.on_upgrade(move |client_socket| async move {
         // Keep the slot until the session ends.
         let _session = session;
-        handle_ws_connection(client_socket, backend_ws_url, backend_label, owner, addr).await
+        handle_ws_connection(
+            client_socket,
+            backend_ws_url,
+            backend_label,
+            owner,
+            addr,
+            idle,
+        )
+        .await
     })
 }
+
+/// Idle-session settings captured at upgrade time.
+#[derive(Clone, Copy)]
+struct WsIdleConfig {
+    timeout: Option<Duration>,
+    ping_interval: Option<Duration>,
+}
+
+impl WsIdleConfig {
+    fn from_proxy(proxy: &crate::config::ProxyConfig) -> Self {
+        let secs = |s: u64| (s != 0).then(|| Duration::from_secs(s));
+        Self {
+            timeout: secs(proxy.ws_idle_timeout_secs),
+            ping_interval: secs(proxy.ws_ping_interval_secs),
+        }
+    }
+}
+
+/// Payload of router-originated pings, so the matching pongs are consumed
+/// here instead of being forwarded to the backend.
+const WS_PING_PAYLOAD: &[u8] = b"sol-rpc-router";
+const WS_IDLE_CLOSE_REASON: &str = "idle timeout";
 
 async fn handle_ws_connection(
     client_socket: WebSocket,
@@ -1048,6 +1082,7 @@ async fn handle_ws_connection(
     backend_label: String,
     owner: String,
     client_addr: SocketAddr,
+    idle: WsIdleConfig,
 ) {
     let backend_socket = match timeout(WS_CONNECT_TIMEOUT, connect_async(&backend_url)).await {
         Ok(Ok((socket, _))) => socket,
@@ -1089,8 +1124,38 @@ async fn handle_ws_connection(
     let bl2 = backend_label.clone();
     let ow2 = owner.clone();
 
+    // Each peer must demonstrate liveness independently. Client pongs must
+    // never keep a dead upstream alive (and backend data cannot prove a client
+    // still reads its socket).
+    let session_start = tokio::time::Instant::now();
+    let client_activity = std::sync::atomic::AtomicU64::new(0);
+    let backend_activity = std::sync::atomic::AtomicU64::new(0);
+    let touch = |activity: &std::sync::atomic::AtomicU64| {
+        let ms = session_start.elapsed().as_millis() as u64;
+        activity.store(ms, std::sync::atomic::Ordering::Relaxed);
+    };
+    let ping_timer = || {
+        idle.ping_interval.map(|period| {
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker
+        })
+    };
+
     let client_to_backend = async {
-        while let Some(msg) = client_read.next().await {
+        let mut ping = ping_timer();
+        loop {
+            let msg = tokio::select! {
+                msg = client_read.next() => msg,
+                _ = async { ping.as_mut().unwrap().tick().await }, if ping.is_some() => {
+                    if backend_write.send(TungsteniteMessage::Ping(WS_PING_PAYLOAD.to_vec())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(msg) = msg else { break };
+            touch(&client_activity);
             let forward = match msg {
                 Ok(Message::Text(text)) => {
                     counter!("ws_messages_total", "backend" => bl1.clone(), "owner" => ow1.clone(), "direction" => "client_to_backend").increment(1);
@@ -1101,6 +1166,7 @@ async fn handle_ws_connection(
                     TungsteniteMessage::Binary(data)
                 }
                 Ok(Message::Ping(data)) => TungsteniteMessage::Ping(data),
+                Ok(Message::Pong(data)) if data == WS_PING_PAYLOAD => continue,
                 Ok(Message::Pong(data)) => TungsteniteMessage::Pong(data),
                 Ok(Message::Close(_)) | Err(_) => break,
             };
@@ -1111,7 +1177,19 @@ async fn handle_ws_connection(
     };
 
     let backend_to_client = async {
-        while let Some(msg) = backend_read.next().await {
+        let mut ping = ping_timer();
+        loop {
+            let msg = tokio::select! {
+                msg = backend_read.next() => msg,
+                _ = async { ping.as_mut().unwrap().tick().await }, if ping.is_some() => {
+                    if client_write.send(Message::Ping(WS_PING_PAYLOAD.to_vec())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(msg) = msg else { break };
+            touch(&backend_activity);
             let forward = match msg {
                 Ok(TungsteniteMessage::Text(text)) => {
                     counter!("ws_messages_total", "backend" => bl2.clone(), "owner" => ow2.clone(), "direction" => "backend_to_client").increment(1);
@@ -1122,6 +1200,7 @@ async fn handle_ws_connection(
                     Message::Binary(data)
                 }
                 Ok(TungsteniteMessage::Ping(data)) => Message::Ping(data),
+                Ok(TungsteniteMessage::Pong(data)) if data == WS_PING_PAYLOAD => continue,
                 Ok(TungsteniteMessage::Pong(data)) => Message::Pong(data),
                 Ok(TungsteniteMessage::Close(_)) | Ok(TungsteniteMessage::Frame(_)) | Err(_) => {
                     break
@@ -1133,13 +1212,60 @@ async fn handle_ws_connection(
         }
     };
 
+    // Either peer going silent is sufficient to close the entire session.
+    let idle_timeout = async {
+        let Some(limit) = idle.timeout else {
+            return std::future::pending().await;
+        };
+        loop {
+            let last = client_activity
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(backend_activity.load(std::sync::atomic::Ordering::Relaxed));
+            let deadline = session_start + Duration::from_millis(last) + limit;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    };
+
+    let mut timed_out = false;
     tokio::select! {
         _ = client_to_backend => {
-            let _ = backend_write.send(TungsteniteMessage::Close(None)).await;
+            let _ = timeout(WS_CLOSE_TIMEOUT, backend_write.send(TungsteniteMessage::Close(None))).await;
         },
         _ = backend_to_client => {
-            let _ = client_write.send(Message::Close(None)).await;
+            let _ = timeout(WS_CLOSE_TIMEOUT, client_write.send(Message::Close(None))).await;
         },
+        _ = idle_timeout => {
+            timed_out = true;
+        },
+    }
+
+    if timed_out {
+        warn!(
+            "WebSocket: {} idle for {:?}, closing session to backend {}",
+            client_addr,
+            idle.timeout.unwrap_or_default(),
+            backend_label
+        );
+        counter!("ws_connections_total", "backend" => backend_label.clone(), "owner" => owner.clone(), "status" => "idle_timeout").increment(1);
+        // Either peer may be dead, so don't let a stuck send hold the slot.
+        let close_client = client_write.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::NORMAL,
+            reason: WS_IDLE_CLOSE_REASON.into(),
+        })));
+        let close_backend = backend_write.send(TungsteniteMessage::Close(Some(
+            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+                reason: WS_IDLE_CLOSE_REASON.into(),
+            },
+        )));
+        let _ = timeout(
+            WS_CLOSE_TIMEOUT,
+            futures_util::future::join(close_client, close_backend),
+        )
+        .await;
     }
 
     let duration = connect_time.elapsed().as_secs_f64();

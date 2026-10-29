@@ -17,6 +17,7 @@ All notable changes to this project are documented here. The format follows
 - Detailed per-backend health (the previous `/health` body, unchanged) is served at `GET /health` on the metrics listener (`metrics_port`), next to `/metrics`. Point dashboards or scripts that read per-backend fields at that port.
 - `key_cache_ttl_secs` (default 60): how long the Redis keystore caches valid keys, i.e. how long `rpc-admin revoke`/`update` take to reach running routers. `0` disables the cache.
 - `rpc-admin list --limit/--offset` for paging (retains at most `offset + limit` rows plus distinct key identities for exact deduplication) and `--active-only` to hide revoked, expired and missing keys.
+- WebSocket idle timeout: `proxy.ws_idle_timeout_secs` (default 300, `0` disables) closes sessions with no frames received from either peer independently, sends a close frame to both peers, frees the per-key slot and counts `ws_connections_total{status="idle_timeout"}`. The router pings both peers every `proxy.ws_ping_interval_secs` (default 30, `0` disables) so live idle subscriptions stay open while dead or half-open peers are dropped. Config validation rejects a ping interval that is not shorter than the idle timeout.
 
 ### Fixed
 - Redis keystore: a cached key is rejected as soon as its `expires_at` passes instead of staying valid for up to 60 s.
