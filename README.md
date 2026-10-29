@@ -242,6 +242,7 @@ Router-generated errors are JSON-RPC shaped and keep your request `id` when the 
 | 504 | -32095 | All attempts timed out |
 | 429 | -32096 | Every healthy backend is out of `max_rps` budget (`Retry-After: 1`) |
 | 408 / 413 | -32600 | Body took over 10 s to arrive / exceeds 10 MB |
+| 400 | -32600 | Body could not be read (client disconnected, malformed chunked encoding) |
 | 500 | -32603 | Keystore failure (for example Redis down) |
 
 Upstream responses, including upstream JSON-RPC errors, pass through unchanged.
@@ -289,6 +290,7 @@ Prometheus metrics (the `rpc_method` label is restricted to known Solana methods
 | `rpc_fanout_total` | counter | `rpc_method`, `outcome` (`ok`, `failed`) |
 | `rpc_blocked_total` | counter | `rpc_method`, `owner` |
 | `rpc_backends_at_capacity_total` | counter | `rpc_method` |
+| `rpc_body_read_errors_total` | counter | `reason` (`too_large`, `timeout`, `read_error`) |
 | `rpc_backend_health` | gauge | `backend` (1 healthy, 0 not) |
 | `rpc_backend_slot` | gauge | `backend` |
 | `rpc_backend_slot_lag` | gauge | `backend` (slots behind the best backend) |

@@ -19,6 +19,7 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - Redis keystore: a cached key is rejected as soon as its `expires_at` passes instead of staying valid for up to 60 s.
 - Redis keystore: unknown keys are cached for 5 s instead of 60 s, so a newly created key starts working sooner on routers that had already rejected it.
+- Request body read failures are no longer all reported as 413: only a body over 10 MB is 413, a slow body is 408 and other read errors (client disconnect, malformed chunked encoding) are 400. New counter `rpc_body_read_errors_total{reason}` tells them apart.
 
 ## [0.3.0] - 2026-10-10
 

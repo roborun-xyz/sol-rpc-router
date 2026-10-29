@@ -467,3 +467,85 @@ async fn test_extract_rpc_method_invalid_json() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(String::from_utf8(body.to_vec()).unwrap(), "none");
 }
+
+// --- request body read errors ---
+
+fn body_reader_app() -> Router {
+    Router::new()
+        .route("/", post(|| async { "ok" }))
+        .layer(middleware::from_fn(extract_rpc_method))
+}
+
+async fn error_code(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["jsonrpc"], "2.0");
+    assert_eq!(json["error"]["code"], -32600);
+    (status, json)
+}
+
+#[tokio::test]
+async fn test_body_too_large_returns_413() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .body(Body::from(vec![b' '; 10 * 1024 * 1024 + 1]))
+        .unwrap();
+
+    let (status, json) = error_code(body_reader_app().oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(json["error"]["message"], "Request body too large");
+}
+
+#[tokio::test]
+async fn test_streamed_body_too_large_returns_413() {
+    // No size hint, so the limit is only hit while streaming.
+    let chunks = futures_util::stream::iter(
+        (0..11).map(|_| Ok::<_, std::io::Error>(vec![b' '; 1024 * 1024])),
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .body(Body::from_stream(chunks))
+        .unwrap();
+
+    let (status, _) = error_code(body_reader_app().oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn test_body_read_error_returns_400() {
+    // Simulates a client that disconnects mid-upload.
+    let chunks = futures_util::stream::iter(vec![
+        Ok(bytes::Bytes::from_static(br#"{"method":"#)),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        )),
+    ]);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .body(Body::from_stream(chunks))
+        .unwrap();
+
+    let (status, json) = error_code(body_reader_app().oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["error"]["message"], "Failed to read request body");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_body_read_timeout_returns_408() {
+    // A body that never finishes; paused time jumps straight to the timeout.
+    let chunks = futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .body(Body::from_stream(chunks))
+        .unwrap();
+
+    let (status, json) = error_code(body_reader_app().oneshot(req).await.unwrap()).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(json["error"]["message"], "Timed out reading request body");
+}

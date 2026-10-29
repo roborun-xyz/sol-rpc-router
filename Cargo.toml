@@ -53,6 +53,7 @@ arc-swap = "1"
 tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tower = "0.5"
 
 [profile.release]
