@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{atomic::Ordering, Arc, RwLock},
     time::SystemTime,
 };
@@ -74,6 +74,24 @@ impl HealthState {
         } else {
             // If backend is new (hot reload), insert it
             statuses.insert(label.to_string(), status);
+        }
+    }
+
+    /// A new config generation owns a filtered snapshot, never the old map.
+    /// In-flight probes can finish on the old state without resurrecting a
+    /// removed label or overwriting the health of a later incarnation.
+    pub fn retained_snapshot<'a>(&self, labels: impl IntoIterator<Item = &'a str>) -> Self {
+        let keep: HashSet<&str> = labels.into_iter().collect();
+        let statuses = self
+            .statuses
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(label, _)| keep.contains(label.as_str()))
+            .map(|(label, status)| (label.clone(), status.clone()))
+            .collect();
+        Self {
+            statuses: RwLock::new(statuses),
         }
     }
 
@@ -373,6 +391,23 @@ mod tests {
         assert!(st.healthy);
         assert_eq!(st.slot, Some(101));
         assert!(st.last_error.is_none());
+    }
+
+    #[test]
+    fn retained_snapshot_prunes_only_missing_labels() {
+        let hs = HealthState::new(vec!["a".into(), "b".into(), "c".into()]);
+        hs.update_status(
+            "b",
+            BackendHealthStatus {
+                healthy: false,
+                ..Default::default()
+            },
+        );
+        let hs = hs.retained_snapshot(["b", "c", "new"]);
+        assert!(hs.get_status("a").is_none());
+        assert!(!hs.get_status("b").unwrap().healthy);
+        assert!(hs.get_status("c").is_some());
+        assert!(hs.get_status("new").is_none(), "retain never inserts");
     }
 
     #[test]

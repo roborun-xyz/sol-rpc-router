@@ -147,10 +147,9 @@ async fn main() {
     }
 
     // SIGHUP hot reload. Health history is kept for backends whose label is
-    // unchanged; new backends start healthy.
+    // unchanged; new backends start healthy; removed backends are pruned.
     {
         let router_state = router_state.clone();
-        let health_state = health_state.clone();
         let config_path = args.config.clone();
         let file_keystore = file_keystore.clone();
         let (boot_port, boot_metrics_port, boot_redis, boot_cache_ttl) = (
@@ -179,13 +178,10 @@ async fn main() {
                                 "port, metrics_port, redis_url and key_cache_ttl_secs changed in the file but only apply after a restart"
                             );
                         }
-                        let new_state =
-                            RouterState::from_config(&new_config, health_state.clone(), |label| {
-                                health_state
-                                    .get_status(label)
-                                    .map(|s| s.healthy)
-                                    .unwrap_or(true)
-                            });
+                        let new_state = RouterState::reload_from_config(
+                            &new_config,
+                            router_state.load().health_state.clone(),
+                        );
                         info!(
                             "Configuration reloaded: {} backends, {} method routes, fanout={:?}, blocked={:?}",
                             new_state.backends.len(),
