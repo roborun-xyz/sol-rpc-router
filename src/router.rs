@@ -18,13 +18,14 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     handlers::{
-        extract_rpc_method, health_endpoint, log_requests, proxy, request_id, require_api_key,
-        track_metrics, ws_proxy,
+        extract_rpc_method, health_details_endpoint, health_endpoint, log_requests, proxy,
+        request_id, require_api_key, track_metrics, ws_proxy, HEALTH_PATH,
     },
     state::AppState,
 };
 
-/// Main listener: JSON-RPC over HTTP, WebSocket upgrades on `/`, and `/health`.
+/// Main listener: JSON-RPC over HTTP, WebSocket upgrades on `/`, and the
+/// public `/health` (aggregate status only).
 pub fn http_router(state: Arc<AppState>) -> Router {
     let rpc = Router::new()
         .route("/", get(ws_proxy).post(proxy))
@@ -37,7 +38,7 @@ pub fn http_router(state: Arc<AppState>) -> Router {
         .with_state(state.clone());
 
     let health = Router::new()
-        .route("/health", get(health_endpoint))
+        .route(HEALTH_PATH, get(health_endpoint))
         .with_state(state);
 
     rpc.merge(health)
@@ -61,7 +62,11 @@ pub fn ws_router(state: Arc<AppState>) -> Router {
         .layer(CorsLayer::permissive())
 }
 
-/// Prometheus scrape endpoint, served on its own port.
-pub fn metrics_router(handle: PrometheusHandle) -> Router {
-    Router::new().route("/metrics", get(move || std::future::ready(handle.render())))
+/// Metrics/admin listener: Prometheus scrape endpoint and the detailed
+/// per-backend `/health`. Keep this port off the public network.
+pub fn metrics_router(handle: PrometheusHandle, state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/metrics", get(move || std::future::ready(handle.render())))
+        .route(HEALTH_PATH, get(health_details_endpoint))
+        .with_state(state)
 }

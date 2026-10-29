@@ -20,12 +20,13 @@ use axum::{
 use http_body_util::BodyExt;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use sol_rpc_router::{
     config::{Backend, ProxyConfig},
     handlers::{ATTEMPTS_HEADER, BACKEND_HEADER, REQUEST_ID_HEADER},
     health::HealthState,
     mock::MockKeyStore,
-    router::http_router,
+    router::{http_router, metrics_router},
     state::{AppState, RouterState, RuntimeBackend},
 };
 use tower::ServiceExt;
@@ -102,6 +103,8 @@ fn backend(label: &str, url: &str, weight: u32) -> RuntimeBackend {
 
 struct TestApp {
     router: Router,
+    /// The metrics/admin listener (`/metrics`, detailed `/health`).
+    metrics: Router,
     keystore: Arc<MockKeyStore>,
 }
 
@@ -130,8 +133,10 @@ fn build_app(
         Arc::new(ArcSwap::from_pointee(router_state)),
     ));
 
+    let handle = PrometheusBuilder::new().build_recorder().handle();
     TestApp {
-        router: http_router(state),
+        router: http_router(state.clone()),
+        metrics: metrics_router(handle, state),
         keystore,
     }
 }
@@ -699,7 +704,27 @@ async fn request_id_is_generated_and_forwarded() {
 }
 
 #[tokio::test]
-async fn health_endpoint_reports_version_and_counts() {
+async fn detailed_health_reports_version_and_counts() {
+    let app = build_app(
+        vec![backend("a", "http://a", 1), backend("b", "http://b", 1)],
+        HashMap::new(),
+        fast_proxy(0),
+    );
+    let req = Request::builder()
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.metrics.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(json["healthy_backends"], 2);
+    assert_eq!(json["total_backends"], 2);
+    assert!(json["backends"][0]["slot"].is_null());
+}
+
+#[tokio::test]
+async fn public_health_omits_version_and_backends() {
     let app = build_app(
         vec![backend("a", "http://a", 1), backend("b", "http://b", 1)],
         HashMap::new(),
@@ -712,10 +737,7 @@ async fn health_endpoint_reports_version_and_counts() {
     let resp = app.router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(json["healthy_backends"], 2);
-    assert_eq!(json["total_backends"], 2);
-    assert!(json["backends"][0]["slot"].is_null());
+    assert_eq!(json, serde_json::json!({ "status": "ok" }));
 }
 
 #[tokio::test]

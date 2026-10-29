@@ -9,6 +9,12 @@ All notable changes to this project are documented here. The format follows
 ### Security
 - 502 responses no longer echo upstream transport errors (backend host, resolver, TLS or connection details) to clients; they now return a generic `Upstream request failed (N attempt(s))` / `All N backends failed` message. The full error chain is logged per attempt with the backend label.
 
+### Changed
+- **Breaking:** the public `/health` on the main port now returns only an aggregate status, `{"status":"ok"}` (200) or `{"status":"unavailable"}` (503). Backend labels, counters, slots, latencies, `last_error` and the router version are no longer exposed on the RPC port.
+
+### Added
+- Detailed per-backend health (the previous `/health` body, unchanged) is served at `GET /health` on the metrics listener (`metrics_port`), next to `/metrics`. Point dashboards or scripts that read per-backend fields at that port.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

@@ -803,9 +803,19 @@ fn bytes_response(status: StatusCode, content_type: Option<HeaderValue>, bytes: 
 }
 
 // ---------------------------------------------------------------------------
-// Health endpoint
+// Health endpoints
 // ---------------------------------------------------------------------------
 
+/// Body of the public `/health` on the main listener. Deliberately carries no
+/// backend labels, counters or probe errors: anyone who can reach the RPC port
+/// can call it, so it only says whether the router can serve traffic.
+#[derive(Serialize)]
+pub struct PublicHealthResponse {
+    /// `"ok"` when at least one backend is healthy, `"unavailable"` otherwise.
+    pub status: &'static str,
+}
+
+/// Body of the detailed `/health` on the metrics listener.
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub overall_status: String,
@@ -833,7 +843,42 @@ pub struct BackendHealth {
     pub last_error: Option<String>,
 }
 
+fn health_http_status(healthy_count: usize) -> StatusCode {
+    if healthy_count > 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// Public liveness probe for load balancers: aggregate status only.
 pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
+    let current_state = state.state.load();
+    let healthy_count = current_state
+        .backends
+        .iter()
+        .filter(|b| {
+            current_state
+                .health_state
+                .get_status(&b.config.label)
+                .unwrap_or_default()
+                .healthy
+        })
+        .count();
+
+    let body = PublicHealthResponse {
+        status: if healthy_count > 0 {
+            "ok"
+        } else {
+            "unavailable"
+        },
+    };
+    (health_http_status(healthy_count), Json(body)).into_response()
+}
+
+/// Per-backend health report. Served on the metrics listener only, because
+/// labels and raw probe errors reveal the upstream setup.
+pub async fn health_details_endpoint(State(state): State<Arc<AppState>>) -> Response {
     let current_state = state.state.load();
     let all_statuses = current_state.health_state.get_all_statuses();
     let now = SystemTime::now();
@@ -883,11 +928,6 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
     } else {
         "unhealthy"
     };
-    let http_status = if healthy_count > 0 {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
 
     let body = HealthResponse {
         overall_status: overall_status.to_string(),
@@ -897,7 +937,7 @@ pub async fn health_endpoint(State(state): State<Arc<AppState>>) -> Response {
         backends,
     };
 
-    (http_status, Json(body)).into_response()
+    (health_http_status(healthy_count), Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------

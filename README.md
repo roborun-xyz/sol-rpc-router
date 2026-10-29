@@ -17,7 +17,7 @@ You have a Helius key, a Triton key, a QuickNode key and the public RPC. Your bo
 - **Per-key auth and rate limits.** Give each bot, friend or service its own key, RPS budget and expiry. Keys live in your config file (zero dependencies) or in Redis when you run several routers that must share limits.
 - **Method blocklist and routing.** Keep `getProgramAccounts` off the shared endpoint, or pin DAS calls to the one provider that supports them.
 - **WebSockets too.** Subscriptions go through the same auth and backend selection.
-- **Observability built in.** Prometheus metrics, a Grafana dashboard, a `/health` endpoint with per-backend slot and latency, `x-request-id` on every response and `x-rpc-backend` on every proxied one.
+- **Observability built in.** Prometheus metrics, a Grafana dashboard, a public `/health` probe plus a detailed per-backend health report (slot, latency, probe errors) on the metrics port, `x-request-id` on every response and `x-rpc-backend` on every proxied one.
 - **Fast.** About 79k req/s in-process at p99 1.8 ms on an Apple M3 Pro laptop, full middleware stack included (see [Benchmark](#benchmark)). The router will not be your bottleneck.
 
 ## Quick start
@@ -122,7 +122,7 @@ flowchart LR
 When no method route applies, a backend is picked at random among healthy backends with budget, in proportion to a weight:
 
 - `weighted` (default): the configured `weight`.
-- `latency_weighted`: `weight × (fastest_latency / own_latency)`, using an exponentially weighted moving average of real request latency through each backend (not probe latency). The fastest backend keeps its full weight; one twice as slow gets half; nothing drops below 5 % of its weight, so a slow provider keeps getting a trickle and can recover. Backends with no sample yet count as fastest so they get measured. `/health` shows the EWMA as `request_latency_ms`.
+- `latency_weighted`: `weight × (fastest_latency / own_latency)`, using an exponentially weighted moving average of real request latency through each backend (not probe latency). The fastest backend keeps its full weight; one twice as slow gets half; nothing drops below 5 % of its weight, so a slow provider keeps getting a trickle and can recover. Backends with no sample yet count as fastest so they get measured. The detailed `/health` on the metrics port shows the EWMA as `request_latency_ms`.
 
 ### Provider budgets
 
@@ -222,8 +222,9 @@ rpc-admin delete <key>                                  # gone
 | `/*path` | POST | yes | Same, with the sub-path appended to the backend URL |
 | `/` | GET + `Upgrade: websocket` | yes | WebSocket proxy on the main port |
 | `ws://host:port+1/` | WS | yes | Dedicated WebSocket listener |
-| `/health` | GET | no | Backend status JSON; 200 if any backend is healthy, else 503 |
+| `/health` | GET | no | Aggregate status only (`{"status":"ok"}` / `{"status":"unavailable"}`); 200 if any backend is healthy, else 503 |
 | `:metrics_port/metrics` | GET | no | Prometheus metrics |
+| `:metrics_port/health` | GET | no | Detailed per-backend health JSON; same 200/503 rule |
 
 Router-generated errors are JSON-RPC shaped and keep your request `id` when the body has been parsed (authentication happens before the body is read, so 401/429/500 carry `id: null`). Router codes live in `-32090..-32099`, outside the `-32001..-32016` range Solana nodes use for their own errors, so clients never mistake a router condition for a node condition:
 
@@ -247,7 +248,15 @@ Upstream responses, including upstream JSON-RPC errors, pass through unchanged.
 
 ## Observability
 
-`GET /health`:
+The public `GET /health` on the main port is meant for load-balancer and container probes. It reports only whether the router can serve traffic, so it never reveals backend labels, counters or upstream errors to clients:
+
+```json
+{"status":"ok"}
+```
+
+It returns 200 with `"ok"` while at least one backend is healthy, and 503 with `"unavailable"` otherwise.
+
+The detailed view is served on the metrics listener (`GET :metrics_port/health`), next to `/metrics`. Like `/metrics` it is unauthenticated, so keep `metrics_port` on a private network:
 
 ```json
 {
@@ -298,6 +307,7 @@ Request logs are one line per request with method, status, duration, backend, ow
 
 - The router speaks plain HTTP. Terminate TLS in front of it (Caddy, nginx, a cloud load balancer).
 - The container `HEALTHCHECK` probes port 28899; override it if you change `port`. `/health` requests are excluded from request logs and metrics.
+- Do not expose `metrics_port` publicly: it serves `/metrics` and the detailed `/health`, both of which name every backend.
 - Expose `port` (and `port+1` if you want the dedicated WS listener). Keep `metrics_port` and Redis private.
 - Run as many router instances as you like against one Redis; rate limits stay consistent. With the file keystore each instance limits independently.
 - Authentication runs before the request body is read, bodies are capped at 10 MB with a 10 s read timeout, key lookups are cached in a bounded cache, and WebSocket sessions are capped per key.
@@ -336,7 +346,7 @@ src/
   main.rs        startup, signal handling, graceful shutdown
   config.rs      TOML config + validation
   state.rs       RouterState (ArcSwap for hot reload), backend selection
-  handlers.rs    middleware, HTTP proxy (retry + fan-out), /health, WebSocket proxy
+  handlers.rs    middleware, HTTP proxy (retry + fan-out), /health (public + detailed), WebSocket proxy
   upstream.rs    upstream URI/header construction, retry classification
   rpc.rs         JSON-RPC probing, error bodies, known-method list
   health.rs      health check loop with slot-lag consensus
